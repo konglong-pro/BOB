@@ -1,0 +1,172 @@
+<Window x:Class="Bob.Windows.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="BOB"
+        Icon="Assets/BOB.ico"
+        Width="1080"
+        Height="760"
+        MinWidth="760"
+        MinHeight="600"
+        WindowStartupLocation="CenterScreen">
+    <Grid Margin="40,32,40,32">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+
+        <Grid Grid.Row="0">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="Auto" />
+            </Grid.ColumnDefinitions>
+
+            <StackPanel>
+                <TextBlock Text="BOB"
+                           FontSize="36"
+                           FontWeight="Bold" />
+                <TextBlock Text="Share content between your phone and computer over the same Wi-Fi"
+                           Margin="2,2,0,0"
+                           Foreground="{StaticResource MutedBrush}"
+                           FontSize="15" />
+            </StackPanel>
+
+            <Border Grid.Column="1"
+                    Padding="14,10"
+                    BorderBrush="{StaticResource StrokeBrush}"
+                    BorderThickness="1.5"
+                    CornerRadius="2">
+                <StackPanel Orientation="Horizontal">
+                    <Ellipse Width="9"
+                             Height="9"
+                             Margin="0,1,9,0"
+                             Fill="{Binding ConnectionBrush}" />
+                    <StackPanel>
+                        <TextBlock Text="{Binding ConnectionText}"
+                                   FontWeight="SemiBold" />
+                        <TextBlock Text="{Binding ServerDetails}"
+                                   Margin="0,2,0,0"
+                                   Foreground="{StaticResource MutedBrush}"
+                                   FontSize="12" />
+                    </StackPanel>
+                </StackPanel>
+            </Border>
+        </Grid>
+
+        <Border Grid.Row="1"
+                Margin="0,32,0,24"
+                BorderBrush="{StaticResource StrokeBrush}"
+                BorderThickness="2"
+                CornerRadius="2"
+                Background="{StaticResource SurfaceBrush}">
+            <Grid>
+                <StackPanel HorizontalAlignment="Center"
+                            VerticalAlignment="Center"
+                            Visibility="{Binding EmptyStateVisibility}">
+                    <TextBlock Text="Send something over"
+                               HorizontalAlignment="Center"
+                               FontSize="28"
+                               FontWeight="Bold" />
+                    <TextBlock Text="Text from your phone will appear here once it connects. Images and files are coming next."
+                               Margin="0,8,0,0"
+                               Foreground="{StaticResource MutedBrush}"
+                               FontSize="15" />
+                </StackPanel>
+
+                <ListBox ItemsSource="{Binding Timeline}"
+                         Margin="18"
+                         Background="Transparent"
+                         BorderThickness="0"
+                         ScrollViewer.HorizontalScrollBarVisibility="Disabled">
+                    <ListBox.ItemContainerStyle>
+                        <Style TargetType="ListBoxItem">
+                            <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+                            <Setter Property="Padding" Value="0" />
+                            <Setter Property="Margin" Value="0,0,0,12" />
+                            <Setter Property="Background" Value="Transparent" />
+                            <Setter Property="BorderThickness" Value="0" />
+                            <Setter Property="Focusable" Value="False" />
+                        </Style>
+                    </ListBox.ItemContainerStyle>
+                    <ListBox.ItemTemplate>
+                        <DataTemplate>
+                            <Border HorizontalAlignment="{Binding Alignment}"
+                                    MaxWidth="620"
+                                    Padding="14,11"
+                                    Background="{StaticResource ButtonBrush}"
+                                    BorderBrush="{StaticResource StrokeBrush}"
+                                    BorderThickness="1.5"
+                                    CornerRadius="2">
+                                <StackPanel>
+                                    <TextBlock Text="{Binding DirectionLabel}"
+                                               Foreground="{StaticResource MutedBrush}"
+                                               FontSize="12"
+                                               FontWeight="SemiBold" />
+                                    <TextBlock Text="{Binding Text}"
+                                               Margin="0,5,0,6"
+                                               TextWrapping="Wrap"
+                                               FontSize="15" />
+                                    <StackPanel Orientation="Horizontal"
+                                                HorizontalAlignment="Right">
+                                        <TextBlock Text="{Binding TimeLabel}"
+                                                   Foreground="{StaticResource MutedBrush}"
+                                                   FontSize="11" />
+                                        <TextBlock Text=" · "
+                                                   Foreground="{StaticResource MutedBrush}"
+                                                   FontSize="11" />
+                                        <TextBlock Text="{Binding Status}"
+                                                   Foreground="{StaticResource MutedBrush}"
+                                                   FontSize="11" />
+                                    </StackPanel>
+                                </StackPanel>
+                            </Border>
+                        </DataTemplate>
+                    </ListBox.ItemTemplate>
+                </ListBox>
+            </Grid>
+        </Border>
+
+        <Grid Grid.Row="2">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+            </Grid.RowDefinitions>
+
+            <TextBox Text="{Binding DraftText, UpdateSourceTrigger=PropertyChanged}"
+                     MinHeight="72"
+                     MaxHeight="160"
+                     AcceptsReturn="True"
+                     VerticalScrollBarVisibility="Auto"
+                     TextWrapping="Wrap"
+                     ToolTip="Enter text to send to your phone" />
+
+            <Grid Grid.Row="1" Margin="0,10,0,0">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+
+                <Button Content="Choose Image"
+                        IsEnabled="False"
+                        ToolTip="Image and file transfers are coming soon." />
+                <Button Grid.Column="1"
+                        Margin="8,0,0,0"
+                        Content="Choose File"
+                        IsEnabled="False"
+                        ToolTip="Image and file transfers are coming soon." />
+                <TextBlock Grid.Column="2"
+                           Margin="14,0"
+                           VerticalAlignment="Center"
+                           Text="{Binding ComposerHint}"
+                           Foreground="{StaticResource MutedBrush}"
+                           FontSize="12" />
+                <Button Grid.Column="3"
+                        MinWidth="96"
+                        Content="Send Text"
+                        Command="{Binding SendTextCommand}" />
+            </Grid>
+        </Grid>
+    </Grid>
+</Window>

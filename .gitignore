@@ -1,0 +1,46 @@
+# Repository-local toolchains
+.tools/
+
+# Build output
+artifacts/
+/BOB.exe
+**/bin/
+**/obj/
+**/build/
+
+# Gradle and Android local state
+.gradle/
+.gradle-user-home/
+.dotnet-home/
+.nuget/
+.build-user/
+**/.gradle/
+**/.kotlin/
+local.properties
+.externalNativeBuild/
+.cxx/
+captures/
+
+# IDE and user state
+.vs/
+.idea/
+.vscode/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# Secrets and signing material
+*.pfx
+*.p12
+*.jks
+*.keystore
+
+# Runtime and transfer leftovers
+*.part
+data/
+logs/
+
+# OS files
+Thumbs.db
+.DS_Store

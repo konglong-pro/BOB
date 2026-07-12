@@ -1,0 +1,16 @@
+schema_version: 1
+current_phase: bob-v1-implementation
+
+phases:
+  - id: bob-v1-implementation
+    status: active
+    implementation_authorized: true
+    canonical_spec: docs/planning/active/bob-v1-spec.md
+    contract: docs/contracts/transport-v1.md
+    decision_record: docs/adr/0001-lan-topology-and-trust.md
+    allowed_areas:
+      - src
+      - tests
+      - docs
+      - scripts
+    release_gate: null
