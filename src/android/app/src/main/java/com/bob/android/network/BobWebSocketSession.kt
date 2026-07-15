@@ -49,6 +49,20 @@ class BobWebSocketSession(
 
         fun onTextAcknowledged(acknowledgement: BobTextAcknowledgement) {}
 
+        fun onTransferOffer(offer: BobTransferOffer) {}
+
+        fun onTransferAccepted(accepted: BobTransferAccepted) {}
+
+        fun onTransferDigest(digest: BobTransferDigest) {}
+
+        fun onTransferCompleted(completed: BobTransferCompleted) {}
+
+        fun onTransferTerminalAck(acknowledgement: BobTransferTerminalAck) {}
+
+        fun onTransferFailed(failed: BobTransferFailed) {}
+
+        fun onTransferProgress(progress: BobTransferProgress) {}
+
         fun onRemoteError(error: BobRemoteError) {}
 
         fun onDisconnected(closure: BobSessionClosure) {}
@@ -179,6 +193,58 @@ class BobWebSocketSession(
         }
         return if (sendConnected(envelope)) envelope.id else null
     }
+
+    fun offerTransfer(
+        transferId: UUID,
+        kind: BobTransferKind,
+        name: String,
+        size: Long?,
+        mediaType: String,
+        createdAt: Instant,
+    ): UUID? = sendEnvelope(
+        BobProtocol.transferOffer(
+            transferId = transferId,
+            retryOf = null,
+            kind = kind,
+            name = name,
+            size = size,
+            mediaType = mediaType,
+            createdAt = createdAt,
+        ),
+    )
+
+    fun acceptTransfer(transferId: UUID, plannedName: String, replyTo: UUID): UUID? =
+        sendEnvelope(BobProtocol.transferAccepted(transferId, plannedName, replyTo))
+
+    fun sendTransferDigest(transferId: UUID, sha256: String, bytes: Long): UUID? =
+        sendEnvelope(BobProtocol.transferDigest(transferId, sha256, bytes))
+
+    fun sendTransferProgress(transferId: UUID, bytes: Long, total: Long?): UUID? =
+        sendEnvelope(BobProtocol.transferProgress(transferId, bytes, total))
+
+    fun sendTransferCompleted(
+        transferId: UUID,
+        bytes: Long,
+        sha256: String,
+        storedName: String,
+    ): UUID? = sendEnvelope(
+        BobProtocol.transferCompleted(transferId, bytes, sha256, storedName),
+    )
+
+    fun acknowledgeTransferTerminal(
+        transferId: UUID,
+        state: BobTransferTerminalState,
+    ): UUID? = sendEnvelope(BobProtocol.transferTerminalAck(transferId, state))
+
+    fun sendTransferFailed(
+        transferId: UUID,
+        code: String,
+        message: String,
+        retryable: Boolean = true,
+    ): UUID? = sendEnvelope(BobProtocol.transferFailed(transferId, code, message, retryable))
+
+    private fun sendEnvelope(envelope: BobEnvelope): UUID? =
+        if (sendConnected(envelope)) envelope.id else null
 
     /** Idempotently begins a graceful close. */
     fun close(code: Int = 1000, reason: String = "client_close"): Boolean {
@@ -422,6 +488,43 @@ class BobWebSocketSession(
                         dispatch(listenerGeneration) {
                             listener.onTextAcknowledged(acknowledgement)
                         }
+                    }
+
+                    "transfer.offer" -> {
+                        val offer = BobProtocol.parseTransferOffer(envelope)
+                        dispatch(listenerGeneration) { listener.onTransferOffer(offer) }
+                    }
+
+                    "transfer.accepted" -> {
+                        val accepted = BobProtocol.parseTransferAccepted(envelope)
+                        dispatch(listenerGeneration) { listener.onTransferAccepted(accepted) }
+                    }
+
+                    "transfer.digest" -> {
+                        val digest = BobProtocol.parseTransferDigest(envelope)
+                        dispatch(listenerGeneration) { listener.onTransferDigest(digest) }
+                    }
+
+                    "transfer.completed" -> {
+                        val completed = BobProtocol.parseTransferCompleted(envelope)
+                        dispatch(listenerGeneration) { listener.onTransferCompleted(completed) }
+                    }
+
+                    "transfer.terminalAck" -> {
+                        val acknowledgement = BobProtocol.parseTransferTerminalAck(envelope)
+                        dispatch(listenerGeneration) {
+                            listener.onTransferTerminalAck(acknowledgement)
+                        }
+                    }
+
+                    "transfer.failed" -> {
+                        val failed = BobProtocol.parseTransferFailed(envelope)
+                        dispatch(listenerGeneration) { listener.onTransferFailed(failed) }
+                    }
+
+                    "transfer.progress" -> {
+                        val progress = BobProtocol.parseTransferProgress(envelope)
+                        dispatch(listenerGeneration) { listener.onTransferProgress(progress) }
                     }
 
                     "error" -> handleRemoteError(listenerGeneration, webSocket, envelope)

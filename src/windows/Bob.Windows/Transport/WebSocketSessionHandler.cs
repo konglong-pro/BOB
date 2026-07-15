@@ -2,6 +2,7 @@ using System.Globalization;
 using System.Net.WebSockets;
 using System.Text;
 using System.Text.Json;
+using Bob.Windows.Domain;
 using Bob.Windows.Security;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Logging;
@@ -13,15 +14,18 @@ public sealed class WebSocketSessionHandler
     private const int ReceiveBufferBytes = 16 * 1024;
     private static readonly TimeSpan ControlFrameTimeout = TimeSpan.FromSeconds(2);
     private readonly SessionCoordinator _sessions;
+    private readonly TransferCoordinator _transfers;
     private readonly ServerIdentity _identity;
     private readonly ILogger<WebSocketSessionHandler> _logger;
 
     public WebSocketSessionHandler(
         SessionCoordinator sessions,
+        TransferCoordinator transfers,
         ServerIdentity identity,
         ILogger<WebSocketSessionHandler> logger)
     {
         _sessions = sessions;
+        _transfers = transfers;
         _identity = identity;
         _logger = logger;
     }
@@ -64,12 +68,14 @@ public sealed class WebSocketSessionHandler
             var hello = await ReceiveEnvelopeAsync(socket, helloTimeout.Token);
             if (hello is null)
             {
+                lease.SetDisconnectReason("Phone closed the connection before sending session.hello.");
                 return;
             }
 
             if (hello.V != BobProtocol.Version
                 || !string.Equals(hello.Type, "session.hello", StringComparison.Ordinal))
             {
+                lease.SetDisconnectReason("Phone did not send a valid BOB session hello.");
                 await SendErrorAsync(
                     lease,
                     "invalid_message",
@@ -83,6 +89,7 @@ public sealed class WebSocketSessionHandler
 
             if (!TryReadHello(hello.Payload, out var client, out var versionSupported))
             {
+                lease.SetDisconnectReason("Phone sent invalid BOB session details.");
                 await SendErrorAsync(
                     lease,
                     "invalid_message",
@@ -96,6 +103,7 @@ public sealed class WebSocketSessionHandler
 
             if (!versionSupported)
             {
+                lease.SetDisconnectReason("Phone and computer use incompatible BOB protocol versions.");
                 await SendErrorAsync(
                     lease,
                     "unsupported_version",
@@ -132,13 +140,16 @@ public sealed class WebSocketSessionHandler
         catch (OperationCanceledException) when (context.RequestAborted.IsCancellationRequested)
         {
             // Normal client disconnect or server shutdown.
+            lease.SetDisconnectReason("Phone disconnected.");
         }
         catch (OperationCanceledException)
         {
+            lease.SetDisconnectReason("Phone did not send session.hello within 5 seconds.");
             await CloseAsync(lease, 4408, "hello_timeout", CancellationToken.None);
         }
         catch (ProtocolException exception)
         {
+            lease.SetDisconnectReason("Phone sent an invalid BOB protocol message.");
             _logger.LogInformation("Rejected malformed WSS message: {Reason}", exception.Message);
             await SendErrorAsync(
                 lease,
@@ -151,6 +162,7 @@ public sealed class WebSocketSessionHandler
         }
         catch (WebSocketException exception)
         {
+            lease.SetDisconnectReason("Phone WebSocket connection was interrupted.");
             _logger.LogDebug(exception, "BOB WSS peer disconnected.");
         }
         finally
@@ -184,30 +196,68 @@ public sealed class WebSocketSessionHandler
             return;
         }
 
-        switch (envelope.Type)
+        try
         {
-            case "text.send":
-                await HandleTextSendAsync(
-                    lease,
-                    peerName,
-                    envelope,
-                    cancellationToken);
-                break;
-            case "text.ack":
-                await HandleTextAckAsync(
-                    lease,
-                    envelope,
-                    cancellationToken);
-                break;
-            default:
-                await SendErrorAsync(
-                    lease,
-                    "invalid_message",
-                    $"Unsupported message type: {envelope.Type}",
-                    retryable: false,
-                    envelope.Id,
-                    cancellationToken);
-                break;
+            switch (envelope.Type)
+            {
+                case "text.send":
+                    await HandleTextSendAsync(
+                        lease,
+                        peerName,
+                        envelope,
+                        cancellationToken);
+                    break;
+                case "text.ack":
+                    await HandleTextAckAsync(
+                        lease,
+                        envelope,
+                        cancellationToken);
+                    break;
+                case "transfer.offer":
+                    await HandleTransferOfferAsync(lease, envelope, cancellationToken);
+                    break;
+                case "transfer.accepted":
+                    await HandleTransferAcceptedAsync(lease, envelope, cancellationToken);
+                    break;
+                case "transfer.digest":
+                    await HandleTransferDigestAsync(lease, envelope, cancellationToken);
+                    break;
+                case "transfer.completed":
+                    await HandleTransferCompletedAsync(lease, envelope, cancellationToken);
+                    break;
+                case "transfer.terminalAck":
+                    await HandleTransferTerminalAckAsync(
+                        lease,
+                        envelope,
+                        cancellationToken);
+                    break;
+                case "transfer.failed":
+                    await HandleTransferFailedAsync(lease, envelope, cancellationToken);
+                    break;
+                case "transfer.progress":
+                    HandleTransferProgress(envelope);
+                    break;
+                default:
+                    await SendErrorAsync(
+                        lease,
+                        "invalid_message",
+                        $"Unsupported message type: {envelope.Type}",
+                        retryable: false,
+                        envelope.Id,
+                        cancellationToken);
+                    break;
+            }
+        }
+        catch (TransferProtocolException exception)
+        {
+            await SendErrorAsync(
+                lease,
+                exception.Code,
+                exception.Message,
+                exception.Retryable,
+                envelope.Id,
+                cancellationToken,
+                exception.TransferId);
         }
     }
 
@@ -276,6 +326,114 @@ public sealed class WebSocketSessionHandler
         }
 
         _sessions.PublishTextAcknowledged(textId);
+    }
+
+    private async Task HandleTransferOfferAsync(
+        SessionLease lease,
+        ProtocolEnvelope envelope,
+        CancellationToken cancellationToken)
+    {
+        var offer = TransferProtocolParser.ParseOffer(envelope.Payload);
+        var decision = _transfers.RegisterIncomingOffer(offer);
+        var response = decision.Reply switch
+        {
+            IncomingOfferReply.Accepted => TransferProtocolMessages.Accepted(
+                offer.TransferId,
+                decision.PlannedName!),
+            IncomingOfferReply.Completed => TransferProtocolMessages.Completed(
+                decision.Completed!),
+            IncomingOfferReply.Failed => TransferProtocolMessages.Failed(
+                decision.Failure!),
+            _ => throw new InvalidOperationException("Unknown incoming offer decision.")
+        };
+        await lease.SendAsync(response, cancellationToken);
+    }
+
+    private Task HandleTransferAcceptedAsync(
+        SessionLease lease,
+        ProtocolEnvelope envelope,
+        CancellationToken cancellationToken)
+    {
+        var accepted = TransferProtocolParser.ParseAccepted(envelope.Payload);
+        _transfers.AcceptOutgoing(accepted.TransferId, accepted.PlannedName);
+        return Task.CompletedTask;
+    }
+
+    private async Task HandleTransferDigestAsync(
+        SessionLease lease,
+        ProtocolEnvelope envelope,
+        CancellationToken cancellationToken)
+    {
+        var digest = TransferProtocolParser.ParseDigest(envelope.Payload);
+        var decision = _transfers.ApplyIncomingDigest(digest);
+        var response = decision.Completed is not null
+            ? TransferProtocolMessages.Completed(decision.Completed)
+            : TransferProtocolMessages.Failed(decision.Failure!);
+        await lease.SendAsync(response, cancellationToken);
+    }
+
+    private async Task HandleTransferCompletedAsync(
+        SessionLease lease,
+        ProtocolEnvelope envelope,
+        CancellationToken cancellationToken)
+    {
+        var completed = TransferProtocolParser.ParseCompleted(envelope.Payload);
+        _transfers.ApplyRemoteCompleted(completed);
+        await lease.SendAsync(
+            TransferProtocolMessages.TerminalAck(
+                completed.TransferId,
+                TransferState.Completed),
+            cancellationToken);
+        await SendNextOutgoingOfferAsync(lease, cancellationToken);
+    }
+
+    private async Task HandleTransferTerminalAckAsync(
+        SessionLease lease,
+        ProtocolEnvelope envelope,
+        CancellationToken cancellationToken)
+    {
+        var acknowledgement = TransferProtocolParser.ParseTerminalAck(envelope.Payload);
+        _transfers.AcknowledgeTerminal(
+            acknowledgement.TransferId,
+            acknowledgement.State);
+        await SendNextOutgoingOfferAsync(lease, cancellationToken);
+    }
+
+    private async Task HandleTransferFailedAsync(
+        SessionLease lease,
+        ProtocolEnvelope envelope,
+        CancellationToken cancellationToken)
+    {
+        var failure = TransferProtocolParser.ParseFailure(envelope.Payload);
+        _transfers.ApplyRemoteFailure(failure);
+        await lease.SendAsync(
+            TransferProtocolMessages.TerminalAck(
+                failure.TransferId,
+                TransferState.Failed),
+            cancellationToken);
+        await SendNextOutgoingOfferAsync(lease, cancellationToken);
+    }
+
+    private void HandleTransferProgress(ProtocolEnvelope envelope)
+    {
+        var progress = TransferProtocolParser.ParseProgress(envelope.Payload);
+        _transfers.ApplyRemoteProgress(
+            progress.TransferId,
+            progress.Bytes,
+            progress.Total);
+    }
+
+    private async Task SendNextOutgoingOfferAsync(
+        SessionLease lease,
+        CancellationToken cancellationToken)
+    {
+        var next = _transfers.TryOfferNextOutgoing();
+        if (next is not null)
+        {
+            await lease.SendAsync(
+                TransferProtocolMessages.Offer(next),
+                cancellationToken);
+        }
     }
 
     private ProtocolEnvelope CreateWelcome(Guid helloId) =>
@@ -446,7 +604,8 @@ public sealed class WebSocketSessionHandler
         string message,
         bool retryable,
         Guid? replyTo,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Guid? transferId = null)
     {
         if (lease.Socket.State != WebSocketState.Open)
         {
@@ -457,7 +616,7 @@ public sealed class WebSocketSessionHandler
         try
         {
             await lease.SendAsync(
-                CreateError(code, message, retryable, replyTo),
+                CreateError(code, message, retryable, replyTo, transferId),
                 timeout.Token);
         }
         catch (OperationCanceledException) when (timeout.IsCancellationRequested)
@@ -508,7 +667,8 @@ public sealed class WebSocketSessionHandler
         string code,
         string message,
         bool retryable,
-        Guid? replyTo) =>
+        Guid? replyTo,
+        Guid? transferId = null) =>
         ProtocolJson.Create(
             "error",
             new
@@ -516,7 +676,7 @@ public sealed class WebSocketSessionHandler
                 code,
                 message,
                 retryable,
-                transferId = (Guid?)null
+                transferId
             },
             replyTo);
 

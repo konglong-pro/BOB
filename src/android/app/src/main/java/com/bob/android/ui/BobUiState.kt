@@ -31,6 +31,17 @@ data class TextTimelineItemUi(
     val isOutgoing: Boolean,
 )
 
+data class TransferTimelineItemUi(
+    val key: String,
+    val name: String,
+    val kindLabel: String,
+    val directionLabel: String,
+    val statusLabel: String,
+    val progressLabel: String,
+    val previewUri: String?,
+    val errorMessage: String?,
+)
+
 data class BobUiState(
     val discoveryLabel: String = "Discovery has not started",
     val isSearching: Boolean = false,
@@ -49,6 +60,8 @@ data class BobUiState(
     val draftText: String = "",
     val draftError: String? = null,
     val canSendText: Boolean = false,
+    val canChooseContent: Boolean = false,
     val isQueueingText: Boolean = false,
     val timeline: List<TextTimelineItemUi> = emptyList(),
+    val transfers: List<TransferTimelineItemUi> = emptyList(),
 )

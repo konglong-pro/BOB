@@ -2,6 +2,7 @@ package com.bob.android.ui
 
 import android.app.Application
 import android.net.InetAddresses
+import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.bob.android.application.BobConnectionCoordinator
@@ -13,9 +14,12 @@ import com.bob.android.discovery.DiscoverySnapshot
 import com.bob.android.discovery.NsdBobDiscoveryService
 import com.bob.android.network.BobEndpoint
 import com.bob.android.network.BobProtocol
+import com.bob.android.network.BobTransferKind
 import com.bob.android.persistence.PersistedTextMessage
 import com.bob.android.persistence.TextDeliveryStatus
 import com.bob.android.persistence.TextDirection
+import com.bob.android.transfer.OnlineTransferItem
+import com.bob.android.transfer.OnlineTransferState
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.util.UUID
@@ -43,6 +47,7 @@ class BobViewModel(application: Application) : AndroidViewModel(application) {
     private var automaticConnectJob: Job? = null
     private var draftTargetIdentity: String? = null
     private var draftRevision = 0L
+    private var externalContentSelectionDepth = 0
 
     private val baseInputs = combine(
         discovery.snapshot,
@@ -59,8 +64,9 @@ class BobViewModel(application: Application) : AndroidViewModel(application) {
         draftText,
         isQueueingText,
         connection.textStore.timeline,
-    ) { base, draft, queueing, messages ->
-        buildUiState(base, draft, queueing, messages)
+        connection.transferItems,
+    ) { base, draft, queueing, messages, transfers ->
+        buildUiState(base, draft, queueing, messages, transfers)
     }.stateIn(
         scope = viewModelScope,
         started = SharingStarted.Eagerly,
@@ -88,15 +94,18 @@ class BobViewModel(application: Application) : AndroidViewModel(application) {
         automaticConnectJob?.cancel()
         automaticConnectJob = null
         discovery.stop()
+        scheduleBackgroundDisconnect()
+    }
+
+    fun beginExternalContentSelection() {
+        externalContentSelectionDepth += 1
         backgroundDisconnectJob?.cancel()
-        backgroundDisconnectJob = viewModelScope.launch {
-            // Avoid tearing down a healthy session during a short configuration change.
-            delay(BACKGROUND_DISCONNECT_DELAY_MILLIS)
-            if (!appVisible) {
-                connection.disconnect("App moved to the background. Local network connection paused.")
-                if (automaticConnectionsEnabled) lastAutomaticEndpointSignature = null
-            }
-        }
+        backgroundDisconnectJob = null
+    }
+
+    fun endExternalContentSelection() {
+        externalContentSelectionDepth = (externalContentSelectionDepth - 1).coerceAtLeast(0)
+        if (!appVisible) scheduleBackgroundDisconnect()
     }
 
     fun refresh() {
@@ -117,7 +126,7 @@ class BobViewModel(application: Application) : AndroidViewModel(application) {
             ),
         )
         notice.value = null
-        connection.connect(peer.toEndpoint())
+        connection.connect(peer.toEndpoints())
     }
 
     fun updateManualIp(value: String) {
@@ -145,8 +154,8 @@ class BobViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
 
-        val resolved = resolveEndpoint(target, discovery.snapshot.value.devices)
-        if (resolved == null) {
+        val resolved = resolveEndpoints(target, discovery.snapshot.value.devices)
+        if (resolved.isNullOrEmpty()) {
             notice.value = "This computer is no longer in the discovery results. Search again or enter its IP address."
             return
         }
@@ -203,6 +212,29 @@ class BobViewModel(application: Application) : AndroidViewModel(application) {
                 notice.value = "Could not queue text. The draft was kept."
             } finally {
                 isQueueingText.value = false
+            }
+        }
+    }
+
+    fun queueImages(uris: List<Uri>) {
+        queueContent(uris, BobTransferKind.Image)
+    }
+
+    fun queueFiles(uris: List<Uri>) {
+        queueContent(uris, BobTransferKind.File)
+    }
+
+    private fun queueContent(uris: List<Uri>, kind: BobTransferKind) {
+        if (uris.isEmpty()) return
+        if (!connection.state.value.isConnected) {
+            notice.value = "Reconnect before sending selected content."
+            return
+        }
+        viewModelScope.launch {
+            try {
+                connection.queueTransfers(uris, kind)
+            } catch (_: Exception) {
+                notice.value = "Could not queue selected content."
             }
         }
     }
@@ -266,7 +298,7 @@ class BobViewModel(application: Application) : AndroidViewModel(application) {
         val selection = selectedTarget.value as? SelectedTarget.Discovered ?: return
         if (!selection.automatic || selection.key != peer.serviceName) return
 
-        val signature = "${peer.deviceId}|${peer.host}|${peer.port}|${peer.network?.networkHandle}"
+        val signature = "${peer.deviceId}|${peer.hosts.joinToString(",")}|${peer.port}|${peer.network?.networkHandle}"
         if (signature == lastAutomaticEndpointSignature) return
         automaticConnectJob = viewModelScope.launch {
             delay(AUTOMATIC_CONNECT_SETTLE_MILLIS)
@@ -275,7 +307,13 @@ class BobViewModel(application: Application) : AndroidViewModel(application) {
                 .singleOrNull()
             if (settled?.serviceName != peer.serviceName || !automaticConnectionsEnabled) return@launch
             lastAutomaticEndpointSignature = signature
-            connection.connect(settled.toEndpoint())
+            val endpoints = settled.toEndpoints()
+            val connected = connection.state.value
+            if (connected.isConnected && connected.serverId?.toString() == settled.deviceId) {
+                connection.refreshConnectedEndpoints(endpoints)
+            } else {
+                connection.connect(endpoints)
+            }
         }
     }
 
@@ -284,6 +322,7 @@ class BobViewModel(application: Application) : AndroidViewModel(application) {
         draft: String,
         queueing: Boolean,
         messages: List<PersistedTextMessage>,
+        transfers: List<OnlineTransferItem>,
     ): BobUiState {
         val snapshot = base.snapshot
         val selection = base.selection
@@ -329,7 +368,7 @@ class BobViewModel(application: Application) : AndroidViewModel(application) {
                 PeerUiModel(
                     key = peer.serviceName,
                     name = peer.displayName,
-                    endpoint = endpoint(peer.host, peer.port),
+                    endpoint = endpoint(peer.preferredHost, peer.port),
                     isCompatible = peer.isCompatible,
                     isSelected = selection is SelectedTarget.Discovered && selection.key == peer.serviceName,
                 )
@@ -356,8 +395,10 @@ class BobViewModel(application: Application) : AndroidViewModel(application) {
             draftError = draftError,
             canSendText = connectionState.isConnected && draft.trim().isNotEmpty() &&
                 draftError == null && !queueing,
+            canChooseContent = connectionState.isConnected,
             isQueueingText = queueing,
             timeline = timeline,
+            transfers = transfers.asReversed().map(::toTransferTimelineItem),
         )
     }
 
@@ -407,29 +448,83 @@ class BobViewModel(application: Application) : AndroidViewModel(application) {
         )
     }
 
-    private fun resolveEndpoint(
-        target: SelectedTarget,
-        peers: List<DiscoveredComputer>,
-    ): BobEndpoint? = when (target) {
-        is SelectedTarget.Discovered -> peers.firstOrNull {
-            it.serviceName == target.key && it.isCompatible
-        }?.toEndpoint()
-        is SelectedTarget.Manual -> BobEndpoint(host = target.address)
+    private fun toTransferTimelineItem(item: OnlineTransferItem): TransferTimelineItemUi {
+        val status = when (item.state) {
+            OnlineTransferState.Queued -> "Queued"
+            OnlineTransferState.Offered -> "Waiting for computer"
+            OnlineTransferState.Accepted -> "Accepted"
+            OnlineTransferState.Transferring -> "Transferring"
+            OnlineTransferState.Verifying -> "Verifying"
+            OnlineTransferState.Completed -> "Completed"
+            OnlineTransferState.Failed -> "Failed"
+        }
+        val progress = item.size?.takeIf { it > 0L }?.let { total ->
+            val percent = ((item.bytesTransferred.coerceAtMost(total) * 100L) / total)
+            "${formatBytes(item.bytesTransferred)} / ${formatBytes(total)} · $percent%"
+        } ?: formatBytes(item.bytesTransferred)
+        return TransferTimelineItemUi(
+            key = item.transferId,
+            name = item.storedName ?: item.name,
+            kindLabel = if (item.kind == BobTransferKind.Image) "Image" else "File",
+            directionLabel = if (item.direction == com.bob.android.transfer.OnlineTransferDirection.Outgoing) {
+                "Sent"
+            } else {
+                "Received"
+            },
+            statusLabel = status,
+            progressLabel = progress,
+            previewUri = item.localContentUri
+                ?.takeIf { item.kind == BobTransferKind.Image }
+                ?.toString(),
+            errorMessage = item.errorMessage,
+        )
     }
 
-    private fun DiscoveredComputer.toEndpoint(): BobEndpoint = BobEndpoint(
-        host = host,
-        port = port,
-        apiPath = apiPath,
-        expectedServerId = UUID.fromString(deviceId),
-        displayNameHint = displayName,
-        socketFactory = network?.socketFactory,
-    )
+    private fun formatBytes(bytes: Long): String = when {
+        bytes >= 1024L * 1024L * 1024L -> "%.1f GiB".format(bytes / (1024.0 * 1024.0 * 1024.0))
+        bytes >= 1024L * 1024L -> "%.1f MiB".format(bytes / (1024.0 * 1024.0))
+        bytes >= 1024L -> "%.1f KiB".format(bytes / 1024.0)
+        else -> "$bytes B"
+    }
+
+    private fun scheduleBackgroundDisconnect() {
+        backgroundDisconnectJob?.cancel()
+        if (externalContentSelectionDepth > 0) return
+        backgroundDisconnectJob = viewModelScope.launch {
+            // Avoid tearing down a healthy session during a short configuration change.
+            delay(BACKGROUND_DISCONNECT_DELAY_MILLIS)
+            if (!appVisible && externalContentSelectionDepth == 0) {
+                connection.disconnect("App moved to the background. Local network connection paused.")
+                if (automaticConnectionsEnabled) lastAutomaticEndpointSignature = null
+            }
+        }
+    }
+
+    private fun resolveEndpoints(
+        target: SelectedTarget,
+        peers: List<DiscoveredComputer>,
+    ): List<BobEndpoint>? = when (target) {
+        is SelectedTarget.Discovered -> peers.firstOrNull {
+            it.serviceName == target.key && it.isCompatible
+        }?.toEndpoints()
+        is SelectedTarget.Manual -> listOf(BobEndpoint(host = target.address))
+    }
+
+    private fun DiscoveredComputer.toEndpoints(): List<BobEndpoint> = hosts.map { host ->
+        BobEndpoint(
+            host = host,
+            port = port,
+            apiPath = apiPath,
+            expectedServerId = UUID.fromString(deviceId),
+            displayNameHint = displayName,
+            socketFactory = network?.socketFactory,
+        )
+    }
 
     private fun targetLabel(target: SelectedTarget, peers: List<DiscoveredComputer>): String =
         when (target) {
             is SelectedTarget.Discovered -> peers.firstOrNull { it.serviceName == target.key }
-                ?.let { "${it.displayName} (${endpoint(it.host, it.port)})" }
+                ?.let { "${it.displayName} (${endpoint(it.preferredHost, it.port)})" }
                 ?: "Offline computer"
             is SelectedTarget.Manual -> endpoint(target.address, DEFAULT_PORT)
         }

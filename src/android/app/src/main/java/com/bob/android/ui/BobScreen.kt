@@ -1,8 +1,17 @@
 package com.bob.android.ui
 
+import android.graphics.Bitmap
+import android.net.Uri
+import android.os.CancellationSignal
+import android.util.Size
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -37,13 +46,18 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.liveRegion
@@ -55,6 +69,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import androidx.lifecycle.compose.LifecycleStartEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -64,9 +79,24 @@ import com.bob.android.ui.theme.BobButton
 import com.bob.android.ui.theme.BobCard
 import com.bob.android.ui.theme.BobInk
 import com.bob.android.ui.theme.BobSecondaryInk
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.withContext
 
 @Composable
 fun BobApp(viewModel: BobViewModel = viewModel()) {
+    val imagePicker = rememberLauncherForActivityResult(
+        ActivityResultContracts.PickMultipleVisualMedia(),
+    ) { uris ->
+        viewModel.endExternalContentSelection()
+        viewModel.queueImages(uris)
+    }
+    val filePicker = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenMultipleDocuments(),
+    ) { uris ->
+        viewModel.endExternalContentSelection()
+        viewModel.queueFiles(uris)
+    }
     LifecycleStartEffect(viewModel) {
         viewModel.startDiscovery()
         onStopOrDispose { viewModel.stopDiscovery() }
@@ -84,6 +114,16 @@ fun BobApp(viewModel: BobViewModel = viewModel()) {
         onResetTrust = viewModel::resetTrust,
         onDraftChanged = viewModel::updateDraftText,
         onSendText = viewModel::sendText,
+        onChooseImages = {
+            viewModel.beginExternalContentSelection()
+            imagePicker.launch(
+                PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly),
+            )
+        },
+        onChooseFiles = {
+            viewModel.beginExternalContentSelection()
+            filePicker.launch(arrayOf("*/*"))
+        },
     )
 }
 
@@ -99,6 +139,8 @@ private fun BobScreen(
     onResetTrust: () -> Unit,
     onDraftChanged: (String) -> Unit,
     onSendText: () -> Unit,
+    onChooseImages: () -> Unit,
+    onChooseFiles: () -> Unit,
 ) {
     Column(
         modifier = Modifier
@@ -150,6 +192,26 @@ private fun BobScreen(
                 Spacer(Modifier.height(14.dp))
                 Notice(message)
             }
+            if (state.transfers.isNotEmpty()) {
+                Spacer(Modifier.height(30.dp))
+                Text(
+                    text = "Transfers",
+                    color = BobInk,
+                    fontSize = 20.sp,
+                    fontWeight = FontWeight.Bold,
+                )
+                Spacer(Modifier.height(10.dp))
+            }
+        }
+
+        if (state.transfers.isNotEmpty()) {
+            items(state.transfers, key = TransferTimelineItemUi::key) { item ->
+                TransferCard(item)
+                Spacer(Modifier.height(10.dp))
+            }
+        }
+
+        item {
             Spacer(Modifier.height(30.dp))
             Text(
                 text = "Recent messages",
@@ -189,6 +251,8 @@ private fun BobScreen(
                 state = state,
                 onDraftChanged = onDraftChanged,
                 onSendText = onSendText,
+                onChooseImages = onChooseImages,
+                onChooseFiles = onChooseFiles,
             )
         }
     }
@@ -557,6 +621,167 @@ private fun TimelineCard(item: TextTimelineItemUi) {
     }
 }
 
+@Composable
+private fun TransferCard(item: TransferTimelineItemUi) {
+    var showFullImage by rememberSaveable(item.key, item.previewUri) { mutableStateOf(false) }
+    val thumbnail = item.previewUri?.let { uri ->
+        rememberContentBitmap(uri, THUMBNAIL_MAX_PIXELS)
+    }
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(BobCard)
+            .border(1.dp, BobBorder, RoundedCornerShape(3.dp))
+            .padding(14.dp),
+    ) {
+        Text(
+            text = item.name,
+            color = BobInk,
+            fontSize = 16.sp,
+            fontWeight = FontWeight.SemiBold,
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis,
+        )
+        Spacer(Modifier.height(6.dp))
+        Text(
+            text = "${item.directionLabel} ${item.kindLabel.lowercase()} · ${item.statusLabel}",
+            color = BobInk,
+            fontSize = 13.sp,
+        )
+        Spacer(Modifier.height(4.dp))
+        Text(text = item.progressLabel, color = BobSecondaryInk, fontSize = 13.sp)
+        if (thumbnail != null) {
+            Spacer(Modifier.height(10.dp))
+            Image(
+                bitmap = remember(thumbnail) { thumbnail.asImageBitmap() },
+                contentDescription = "Preview of ${item.name}",
+                contentScale = ContentScale.Crop,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(180.dp)
+                    .clip(RoundedCornerShape(3.dp))
+                    .background(BobButton)
+                    .clickable(
+                        role = Role.Button,
+                        onClickLabel = "View full image",
+                        onClick = { showFullImage = true },
+                    )
+                    .border(1.dp, BobBorder, RoundedCornerShape(3.dp)),
+            )
+            Spacer(Modifier.height(8.dp))
+            BobButton(
+                label = "View image",
+                onClick = { showFullImage = true },
+                fillWidth = true,
+            )
+        }
+        item.errorMessage?.let { error ->
+            Spacer(Modifier.height(6.dp))
+            Text(text = error, color = BobInk, fontSize = 13.sp, lineHeight = 18.sp)
+        }
+    }
+    if (showFullImage && thumbnail != null) {
+        FullImageDialog(
+            name = item.name,
+            previewUri = item.previewUri,
+            thumbnail = thumbnail,
+            onDismiss = { showFullImage = false },
+        )
+    }
+}
+
+@Composable
+private fun FullImageDialog(
+    name: String,
+    previewUri: String,
+    thumbnail: Bitmap,
+    onDismiss: () -> Unit,
+) {
+    val fullImage = rememberContentBitmap(
+        uriValue = previewUri,
+        maxDimension = FULL_IMAGE_MAX_PIXELS,
+        fallback = thumbnail,
+    ) ?: thumbnail
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false),
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(20.dp)
+                .background(BobCard)
+                .border(2.dp, BobBorder, RoundedCornerShape(4.dp))
+                .padding(16.dp),
+        ) {
+            Text(
+                text = "Image preview",
+                color = BobInk,
+                fontSize = 20.sp,
+                fontWeight = FontWeight.Bold,
+            )
+            Spacer(Modifier.height(4.dp))
+            Text(
+                text = name,
+                color = BobSecondaryInk,
+                fontSize = 14.sp,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Spacer(Modifier.height(12.dp))
+            Image(
+                bitmap = remember(fullImage) { fullImage.asImageBitmap() },
+                contentDescription = "Full image preview of $name",
+                contentScale = ContentScale.Fit,
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth()
+                    .background(Color.Black)
+                    .border(1.dp, BobBorder, RoundedCornerShape(3.dp)),
+            )
+            Spacer(Modifier.height(12.dp))
+            BobButton(
+                label = "Close",
+                onClick = onDismiss,
+                fillWidth = true,
+            )
+        }
+    }
+}
+
+@Composable
+private fun rememberContentBitmap(
+    uriValue: String,
+    maxDimension: Int,
+    fallback: Bitmap? = null,
+): Bitmap? {
+    val resolver = LocalContext.current.contentResolver
+    val bitmap by produceState<Bitmap?>(
+        initialValue = fallback,
+        uriValue,
+        maxDimension,
+    ) {
+        value = withContext(Dispatchers.IO) {
+            val cancellationSignal = CancellationSignal()
+            val cancellationHandle = coroutineContext[Job]?.invokeOnCompletion {
+                cancellationSignal.cancel()
+            }
+            try {
+                runCatching {
+                    resolver.loadThumbnail(
+                        Uri.parse(uriValue),
+                        Size(maxDimension, maxDimension),
+                        cancellationSignal,
+                    )
+                }.getOrNull()
+            } finally {
+                cancellationHandle?.dispose()
+            }
+        } ?: fallback
+    }
+    return bitmap
+}
+
 @Suppress("DEPRECATION")
 @Composable
 private fun FullTextDialog(text: String, onDismiss: () -> Unit) {
@@ -621,6 +846,8 @@ private fun TextComposer(
     state: BobUiState,
     onDraftChanged: (String) -> Unit,
     onSendText: () -> Unit,
+    onChooseImages: () -> Unit,
+    onChooseFiles: () -> Unit,
 ) {
     Column(
         modifier = Modifier
@@ -628,6 +855,24 @@ private fun TextComposer(
             .heightIn(max = 260.dp)
             .verticalScroll(rememberScrollState()),
     ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            BobButton(
+                label = "Choose images",
+                onClick = onChooseImages,
+                modifier = Modifier.weight(1f),
+                enabled = state.canChooseContent,
+            )
+            BobButton(
+                label = "Choose files",
+                onClick = onChooseFiles,
+                modifier = Modifier.weight(1f),
+                enabled = state.canChooseContent,
+            )
+        }
+        Spacer(Modifier.height(10.dp))
         OutlinedTextField(
             value = state.draftText,
             onValueChange = onDraftChanged,
@@ -685,6 +930,8 @@ private fun String.toDisplayChunks(): List<DisplayTextChunk> {
 }
 
 private const val DISPLAY_CHUNK_CHARS = 512
+private const val THUMBNAIL_MAX_PIXELS = 720
+private const val FULL_IMAGE_MAX_PIXELS = 2_048
 
 @Composable
 private fun BobButton(

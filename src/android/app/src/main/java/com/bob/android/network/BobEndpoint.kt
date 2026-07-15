@@ -30,6 +30,9 @@ data class BobEndpoint(
     /** OkHttp upgrades this pinned HTTPS URL to a secure WebSocket connection. */
     fun webSocketUrl(): HttpUrl = urlFor("ws")
 
+    fun transferContentUrl(transferId: UUID): HttpUrl =
+        urlFor("transfers/${transferId}/content")
+
     private fun urlFor(relativePath: String): HttpUrl = HttpUrl.Builder()
         .scheme("https")
         .host(host.removeSurrounding("[", "]"))

@@ -4,11 +4,11 @@ BOB 是一个自用的 Android 14 与 Windows 10/11 局域网双向传输工具�
 
 ## 当前状态
 
-连接与文字切片已经落地：
+连接、文字与前台在线文件切片已经落地：
 
-- Windows：全英文 WPF GUI、共享像素风图标、HTTPS/WSS 服务、`/bob/v1/info`、会话握手、进程内文字收发，以及原生 Windows DNS-SD 广播。
-- Android：全英文 Compose GUI、共享像素风图标、局域网发现、手动 IP、受限 TOFU、严格完整证书 pin、HTTPS `/info`、`bob.v1` WSS 会话和持久双向文字时间线。
-- 图片和文件的 HTTPS 正文流尚未实现；Android 14 真机与真实 Windows 的最终连接验收仍需在设备接入后执行。
+- Windows：全英文 WPF GUI、共享像素风图标、HTTPS/WSS 服务、原生 DNS-SD、进程内文字，以及图片/文件多选、流式 PUT/GET、SHA-256、`.part`、禁止覆盖发布、图片预览和可持久配置的收件目录。
+- Android：全英文 Compose GUI、共享像素风图标、多地址局域网发现、手动 IP、受限 TOFU、严格完整证书 pin、持久文字，以及图片/文件多选、流式 PUT/GET、pending MediaStore 发布和图片预览；连接失败会显示候选地址和安全分类后的网络/TLS/WSS 原因。
+- 当前文件传输只承诺双方在线且 Android 位于前台；离线/重启恢复、锁屏前台服务、取消/重试、系统分享入口与 Windows 拖放尚未实现。Android 14 真机的最终连接、双向正文和 MediaStore 验收仍需设备接入。
 
 ## 本地工具
 
@@ -30,7 +30,9 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\publish-window
 
 也可用 `-Target Windows` 或 `-Target Android` 只运行一端。
 
-`publish-windows-launcher.ps1` 会构建 Windows Release 版本，并在仓库根目录生成可直接双击的 `BOB.exe`。快捷启动器没有控制台窗口，使用仓库自带的 `.tools/dotnet`，因此需要和完整的 BOB 仓库目录一起保留。
+`publish-windows-launcher.ps1` 会构建 Windows Release 版本，并在仓库根目录生成可直接双击的 `BOB.exe`。快捷启动器没有控制台窗口，使用仓库自带的 `.tools/dotnet`，因此需要和完整的 BOB 仓库目录一起保留。普通 `build.ps1` 默认只更新 Debug；准备通过根目录 `BOB.exe` 联调时必须重新运行发布脚本，避免启动旧 Release。
+
+只有 Android 显示 `Connected` 且 Windows 右上角显示 `Phone connected · <手机名>`，才表示 HTTPS、证书 pin、WSS hello/welcome 和最终 snapshot 已全部完成。Windows 等待、握手和断开原因会保留在同一状态框中。
 
 Android 调试 APK 构建在 `src/android/app/build/outputs/apk/debug/app-debug.apk`。连接 Android 14 手机并开启 USB 调试后，可用项目内的 `adb` 安装：
 

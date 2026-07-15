@@ -3,6 +3,7 @@ using System.Threading;
 using System.Windows;
 using Bob.Windows.Discovery;
 using Bob.Windows.Security;
+using Bob.Windows.Storage;
 using Bob.Windows.Transport;
 using Bob.Windows.UI;
 using Microsoft.AspNetCore.Builder;
@@ -72,6 +73,8 @@ public partial class App : Application
             builder.Services.AddSingleton(identity);
             builder.Services.AddHostedService<MdnsAdvertisementService>();
             builder.Services.AddSingleton<SessionCoordinator>();
+            builder.Services.AddSingleton<ReceiveDirectorySettings>();
+            builder.Services.AddSingleton<TransferCoordinator>();
             builder.Services.AddSingleton<WebSocketSessionHandler>();
             builder.Services.AddSingleton<MainWindowViewModel>();
             builder.Services.AddSingleton<MainWindow>();

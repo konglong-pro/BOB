@@ -3,12 +3,23 @@ package com.bob.android.security
 import android.annotation.SuppressLint
 import java.security.cert.CertificateException
 import java.security.cert.X509Certificate
+import java.util.concurrent.atomic.AtomicReference
 import javax.net.ssl.X509TrustManager
 
+internal interface BobObservedPinTrustManager : X509TrustManager {
+    val observedServerPin: String?
+}
+
 @SuppressLint("CustomX509TrustManager") // Deliberately validates the complete BOB certificate profile.
-internal class BobProbeTrustManager : X509TrustManager {
+internal class BobProbeTrustManager : BobObservedPinTrustManager {
+    private val observedPin = AtomicReference<String?>(null)
+
+    override val observedServerPin: String?
+        get() = observedPin.get()
+
     override fun checkServerTrusted(chain: Array<out X509Certificate>?, authType: String?) {
-        BobCertificateProfileValidator.validate(chain)
+        val leaf = BobCertificateProfileValidator.validate(chain)
+        observedPin.set(BobCertificatePin.fromCertificate(leaf))
     }
 
     override fun checkClientTrusted(chain: Array<out X509Certificate>?, authType: String?) {
@@ -22,7 +33,12 @@ internal class BobProbeTrustManager : X509TrustManager {
 internal class BobPinnedTrustManager(
     private val expectedPin: String,
     private val serverId: java.util.UUID,
-) : X509TrustManager {
+) : BobObservedPinTrustManager {
+    private val observedPin = AtomicReference<String?>(null)
+
+    override val observedServerPin: String?
+        get() = observedPin.get()
+
     init {
         BobCertificatePin.requireCanonical(expectedPin)
     }
@@ -33,6 +49,7 @@ internal class BobPinnedTrustManager(
         if (!BobCertificatePin.matches(expectedPin, observedPin)) {
             throw BobCertificatePinMismatchException(serverId)
         }
+        this.observedPin.set(observedPin)
     }
 
     override fun checkClientTrusted(chain: Array<out X509Certificate>?, authType: String?) {

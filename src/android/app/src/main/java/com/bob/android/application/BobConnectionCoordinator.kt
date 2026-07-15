@@ -1,6 +1,7 @@
 package com.bob.android.application
 
 import android.content.Context
+import android.net.Uri
 import android.os.Build
 import com.bob.android.network.BobEndpoint
 import com.bob.android.network.BobHttpsConnection
@@ -13,6 +14,14 @@ import com.bob.android.network.BobSessionClosure
 import com.bob.android.network.BobSessionPhase
 import com.bob.android.network.BobSessionState
 import com.bob.android.network.BobTextAcknowledgement
+import com.bob.android.network.BobTransferAccepted
+import com.bob.android.network.BobTransferCompleted
+import com.bob.android.network.BobTransferDigest
+import com.bob.android.network.BobTransferFailed
+import com.bob.android.network.BobTransferKind
+import com.bob.android.network.BobTransferOffer
+import com.bob.android.network.BobTransferProgress
+import com.bob.android.network.BobTransferTerminalAck
 import com.bob.android.network.BobWebSocketSession
 import com.bob.android.network.BobWelcome
 import com.bob.android.persistence.AtomicTextMessageStore
@@ -27,8 +36,13 @@ import com.bob.android.security.BobSecurityException
 import com.bob.android.security.BobServerInfoException
 import com.bob.android.security.BobTrustConflictException
 import com.bob.android.security.BobTrustStore
+import com.bob.android.transfer.OnlineTransferCoordinator
 import java.io.Closeable
 import java.io.IOException
+import java.net.ConnectException
+import java.net.NoRouteToHostException
+import java.net.SocketTimeoutException
+import java.net.UnknownHostException
 import java.time.Instant
 import java.util.UUID
 import javax.net.ssl.SSLHandshakeException
@@ -88,10 +102,12 @@ class BobConnectionCoordinator(
     private val outboxMutex = Mutex()
     private val mutableState = MutableStateFlow(BobConnectionState())
     val state: StateFlow<BobConnectionState> = mutableState.asStateFlow()
+    private val transferCoordinator = OnlineTransferCoordinator(applicationContext, scope)
+    val transferItems = transferCoordinator.items
 
     private var generation = 0L
     private var connectionJob: Job? = null
-    private var requestedEndpoint: BobEndpoint? = null
+    private var requestedEndpoints: List<BobEndpoint> = emptyList()
     private var transportGeneration: Long? = null
     private var httpsConnection: BobHttpsConnection? = null
     private var webSocketSession: BobWebSocketSession? = null
@@ -99,17 +115,38 @@ class BobConnectionCoordinator(
     private var closed = false
 
     fun connect(endpoint: BobEndpoint) {
+        connect(listOf(endpoint))
+    }
+
+    fun connect(endpoints: List<BobEndpoint>) {
         if (closed || trustResetInProgress) return
+        require(endpoints.isNotEmpty()) { "At least one BOB endpoint is required." }
+        val distinctEndpoints = endpoints.distinctBy { endpoint ->
+            "${endpoint.host.lowercase()}:${endpoint.port}:${endpoint.expectedServerId}"
+        }
         val current = mutableState.value
-        if (requestedEndpoint == endpoint && current.phase in ACTIVE_PHASES) return
+        if (requestedEndpoints == distinctEndpoints && current.phase in ACTIVE_PHASES) return
 
         generation += 1
         val connectionGeneration = generation
-        requestedEndpoint = endpoint
+        requestedEndpoints = distinctEndpoints
         connectionJob?.cancel()
         closeTransport()
         connectionJob = scope.launch {
-            runConnectionLoop(connectionGeneration, endpoint)
+            runConnectionLoop(connectionGeneration, distinctEndpoints)
+        }
+    }
+
+    fun refreshConnectedEndpoints(endpoints: List<BobEndpoint>) {
+        if (closed || endpoints.isEmpty()) return
+        val connectedServerId = mutableState.value.serverId ?: return
+        if (!mutableState.value.isConnected ||
+            endpoints.none { endpoint -> endpoint.expectedServerId == connectedServerId }
+        ) {
+            return
+        }
+        requestedEndpoints = endpoints.distinctBy { endpoint ->
+            "${endpoint.host.lowercase()}:${endpoint.port}:${endpoint.expectedServerId}"
         }
     }
 
@@ -127,7 +164,7 @@ class BobConnectionCoordinator(
         )
         mutableState.value = BobConnectionState(
             phase = BobConnectionPhase.Idle,
-            endpoint = requestedEndpoint,
+            endpoint = requestedEndpoints.firstOrNull(),
             serverId = previous.serverId.takeIf { wasAuthenticated },
             serverName = previous.serverName.takeIf { wasAuthenticated },
             message = message,
@@ -158,7 +195,7 @@ class BobConnectionCoordinator(
                 trustResetInProgress = false
                 mutableState.value = BobConnectionState(
                     phase = BobConnectionPhase.Idle,
-                    endpoint = requestedEndpoint,
+                    endpoint = requestedEndpoints.firstOrNull(),
                     message = "Certificate trust reset. Reconnect to trust this computer again.",
                 )
             } catch (error: Exception) {
@@ -166,7 +203,7 @@ class BobConnectionCoordinator(
                 trustResetInProgress = false
                 mutableState.value = BobConnectionState(
                     phase = BobConnectionPhase.Failed,
-                    endpoint = requestedEndpoint,
+                    endpoint = requestedEndpoints.firstOrNull(),
                     serverId = serverId,
                     message = error.userMessage("Could not reset trust"),
                 )
@@ -211,60 +248,103 @@ class BobConnectionCoordinator(
         return message
     }
 
-    private suspend fun runConnectionLoop(connectionGeneration: Long, endpoint: BobEndpoint) {
-        var attempt = 0
-        var authenticatedEndpoint = endpoint
-        while (currentCoroutineContext().isActive && isCurrent(connectionGeneration)) {
-            mutableState.value = BobConnectionState(
-                phase = BobConnectionPhase.Securing,
-                endpoint = authenticatedEndpoint,
-                serverId = authenticatedEndpoint.expectedServerId,
-                serverName = authenticatedEndpoint.displayNameHint,
-                message = if (attempt == 0) "Verifying HTTPS certificate" else "Revalidating secure connection",
-                retryAttempt = attempt,
-            )
+    suspend fun queueTransfers(uris: List<Uri>, kind: BobTransferKind) {
+        if (!mutableState.value.isConnected) {
+            throw IllegalStateException("Secure session is not connected.")
+        }
+        transferCoordinator.queueOutgoing(uris, kind)
+    }
 
-            val outcome = try {
-                val established = httpsConnector.establish(authenticatedEndpoint)
-                if (!isCurrent(connectionGeneration)) {
-                    established.close()
-                    return
+    private suspend fun runConnectionLoop(
+        connectionGeneration: Long,
+        initialEndpoints: List<BobEndpoint>,
+    ) {
+        var attempt = 0
+        var preferredEndpoint: BobEndpoint? = null
+        while (currentCoroutineContext().isActive && isCurrent(connectionGeneration)) {
+            val endpoints = requestedEndpoints.ifEmpty { initialEndpoints }
+            val candidates = preferredEndpoint
+                ?.let { preferred ->
+                    listOf(preferred) + endpoints.filterNot { candidate ->
+                        candidate.host.equals(preferred.host, ignoreCase = true) &&
+                            candidate.port == preferred.port
+                    }
                 }
-                // A manually entered IP probes only for the first logical connection. Once the
-                // server is authenticated, every automatic retry is pinned to that serverId.
-                authenticatedEndpoint = authenticatedEndpoint.copy(
-                    expectedServerId = established.serverInfo.serverId,
-                    displayNameHint = established.serverInfo.name,
+                ?: endpoints
+            var outcome: ConnectionOutcome = ConnectionOutcome.Retry("Connection failed")
+            for ((index, endpoint) in candidates.withIndex()) {
+                mutableState.value = BobConnectionState(
+                    phase = BobConnectionPhase.Securing,
+                    endpoint = endpoint,
+                    serverId = endpoint.expectedServerId,
+                    serverName = endpoint.displayNameHint,
+                    message = if (candidates.size == 1) {
+                        if (attempt == 0) "Verifying HTTPS certificate" else "Revalidating secure connection"
+                    } else {
+                        "Trying secure address ${index + 1} of ${candidates.size}"
+                    },
+                    retryAttempt = attempt,
                 )
-                transportGeneration = connectionGeneration
-                httpsConnection = established
-                runWebSocket(connectionGeneration, established)
-            } catch (error: Throwable) {
-                closeTransport(connectionGeneration)
-                if (!isCurrent(connectionGeneration)) return
-                val blockedServerId = error.blockedServerId(authenticatedEndpoint)
-                if (error.isTrustOrIdentityFailure()) {
-                    mutableState.value = BobConnectionState(
-                        phase = BobConnectionPhase.Blocked,
-                        endpoint = authenticatedEndpoint,
-                        serverId = blockedServerId,
-                        serverName = authenticatedEndpoint.displayNameHint,
-                        message = error.userMessage("Certificate or computer identity verification failed"),
-                        trustResetAllowed = error.allowsTrustReset(),
+
+                try {
+                    val established = httpsConnector.establish(endpoint)
+                    if (!isCurrent(connectionGeneration)) {
+                        established.close()
+                        return
+                    }
+                    // Once any candidate authenticates, retries for that concrete address are
+                    // strict-pinned to the observed serverId. Every discovered candidate retains
+                    // the same mDNS serverId and Android Network socket factory.
+                    preferredEndpoint = endpoint.copy(
+                        expectedServerId = established.serverInfo.serverId,
+                        displayNameHint = established.serverInfo.name,
                     )
-                    return
-                }
-                if (error.isInvalidServerResponse()) {
-                    mutableState.value = BobConnectionState(
-                        phase = BobConnectionPhase.Failed,
-                        endpoint = authenticatedEndpoint,
-                        serverId = authenticatedEndpoint.expectedServerId,
-                        serverName = authenticatedEndpoint.displayNameHint,
-                        message = error.userMessage("Invalid response from BOB service"),
+                    transportGeneration = connectionGeneration
+                    httpsConnection = established
+                    outcome = runWebSocket(connectionGeneration, established)
+                    break
+                } catch (error: Throwable) {
+                    closeTransport(connectionGeneration)
+                    if (!isCurrent(connectionGeneration)) return
+                    val blockedServerId = error.blockedServerId(endpoint)
+                    if (error.isTrustOrIdentityFailure()) {
+                        mutableState.value = BobConnectionState(
+                            phase = BobConnectionPhase.Blocked,
+                            endpoint = endpoint,
+                            serverId = blockedServerId,
+                            serverName = endpoint.displayNameHint,
+                            message = error.userMessage(
+                                "Certificate or computer identity verification failed",
+                                endpoint,
+                            ),
+                            trustResetAllowed = error.allowsTrustReset(),
+                        )
+                        return
+                    }
+                    if (error.isInvalidServerResponse()) {
+                        mutableState.value = BobConnectionState(
+                            phase = BobConnectionPhase.Failed,
+                            endpoint = endpoint,
+                            serverId = endpoint.expectedServerId,
+                            serverName = endpoint.displayNameHint,
+                            message = error.userMessage("Invalid response from BOB service", endpoint),
+                        )
+                        return
+                    }
+                    if (!error.isReachabilityFailure()) {
+                        mutableState.value = BobConnectionState(
+                            phase = BobConnectionPhase.Failed,
+                            endpoint = endpoint,
+                            serverId = endpoint.expectedServerId,
+                            serverName = endpoint.displayNameHint,
+                            message = error.userMessage("Connection failed", endpoint),
+                        )
+                        return
+                    }
+                    outcome = ConnectionOutcome.Retry(
+                        error.userMessage("Connection failed", endpoint),
                     )
-                    return
                 }
-                ConnectionOutcome.Retry(error.userMessage("Connection failed"))
             }
 
             closeTransport(connectionGeneration)
@@ -278,7 +358,7 @@ class BobConnectionCoordinator(
                     val retryMessage = outcome.message.trim().trimEnd('.', '!', '?')
                     mutableState.value = mutableState.value.copy(
                         phase = BobConnectionPhase.Retrying,
-                        endpoint = authenticatedEndpoint,
+                        endpoint = preferredEndpoint ?: endpoints.first(),
                         message = "$retryMessage. Retrying in $delayLabel.",
                         retryAttempt = attempt,
                     )
@@ -293,6 +373,7 @@ class BobConnectionCoordinator(
         connection: BobHttpsConnection,
     ): ConnectionOutcome {
         val terminal = CompletableDeferred<BobSessionClosure>()
+        var lastFailureMessage: String? = null
         lateinit var session: BobWebSocketSession
         val listener = object : BobWebSocketSession.Listener {
             override fun onStateChanged(state: BobSessionState) {
@@ -327,6 +408,9 @@ class BobConnectionCoordinator(
 
             override fun onConnected(welcome: BobWelcome) {
                 if (!isCurrentSession(connectionGeneration, session)) return
+                // The server may send a transfer.offer immediately after the final snapshot.
+                // Attach before any persistence suspension so that first offer cannot be lost.
+                transferCoordinator.attach(connection, session)
                 scope.launch {
                     try {
                         outboxMutex.withLock {
@@ -415,6 +499,48 @@ class BobConnectionCoordinator(
                 }
             }
 
+            override fun onTransferOffer(offer: BobTransferOffer) {
+                if (isCurrentSession(connectionGeneration, session)) {
+                    transferCoordinator.onOffer(offer)
+                }
+            }
+
+            override fun onTransferAccepted(accepted: BobTransferAccepted) {
+                if (isCurrentSession(connectionGeneration, session)) {
+                    transferCoordinator.onAccepted(accepted)
+                }
+            }
+
+            override fun onTransferDigest(digest: BobTransferDigest) {
+                if (isCurrentSession(connectionGeneration, session)) {
+                    transferCoordinator.onDigest(digest)
+                }
+            }
+
+            override fun onTransferCompleted(completed: BobTransferCompleted) {
+                if (isCurrentSession(connectionGeneration, session)) {
+                    transferCoordinator.onCompleted(completed)
+                }
+            }
+
+            override fun onTransferTerminalAck(acknowledgement: BobTransferTerminalAck) {
+                if (isCurrentSession(connectionGeneration, session)) {
+                    transferCoordinator.onTerminalAck(acknowledgement)
+                }
+            }
+
+            override fun onTransferFailed(failed: BobTransferFailed) {
+                if (isCurrentSession(connectionGeneration, session)) {
+                    transferCoordinator.onFailed(failed)
+                }
+            }
+
+            override fun onTransferProgress(progress: BobTransferProgress) {
+                if (isCurrentSession(connectionGeneration, session)) {
+                    transferCoordinator.onProgress(progress)
+                }
+            }
+
             override fun onRemoteError(error: BobRemoteError) {
                 if (!isCurrentSession(connectionGeneration, session)) return
                 mutableState.value = mutableState.value.copy(
@@ -425,8 +551,10 @@ class BobConnectionCoordinator(
             override fun onFailure(error: Throwable, httpStatus: Int?) {
                 if (!isCurrentSession(connectionGeneration, session)) return
                 val suffix = httpStatus?.let { " (HTTP $it)" }.orEmpty()
+                lastFailureMessage =
+                    error.userMessage("WSS connection failed", connection.endpoint) + suffix
                 mutableState.value = mutableState.value.copy(
-                    message = error.userMessage("WSS connection failed") + suffix,
+                    message = lastFailureMessage,
                 )
             }
 
@@ -454,7 +582,8 @@ class BobConnectionCoordinator(
             connection,
             "Establishing secure WSS session",
         )
-        if (!session.connect()) {
+        val started = session.connect()
+        if (!started && session.state.closure == null) {
             session.dispose()
             return ConnectionOutcome.Retry("Could not start WSS session")
         }
@@ -479,6 +608,8 @@ class BobConnectionCoordinator(
                     BobSessionCloseCause.HelloTimeout -> "WSS session confirmation timed out"
                     BobSessionCloseCause.Normal -> "WSS session closed"
                     BobSessionCloseCause.RemoteClose -> "The computer closed the WSS session"
+                    BobSessionCloseCause.NetworkFailure ->
+                        lastFailureMessage ?: "WSS connection was interrupted"
                     else -> "WSS connection was interrupted"
                 },
             )
@@ -586,6 +717,7 @@ class BobConnectionCoordinator(
         if (ownerGeneration != null && transportGeneration != ownerGeneration) return
         val session = webSocketSession
         webSocketSession = null
+        if (session != null) transferCoordinator.detach(session)
         session?.dispose()
         val connection = httpsConnection
         httpsConnection = null
@@ -636,6 +768,9 @@ private fun Throwable.isTrustOrIdentityFailure(): Boolean =
 private fun Throwable.isInvalidServerResponse(): Boolean =
     causeChain().any { it is BobServerInfoException || it is BobHttpsException }
 
+private fun Throwable.isReachabilityFailure(): Boolean =
+    causeChain().any { it is IOException }
+
 private fun Throwable.blockedServerId(endpoint: BobEndpoint): UUID? =
     causeChain().firstNotNullOfOrNull { cause ->
         when (cause) {
@@ -658,7 +793,35 @@ private fun Throwable.causeChain(): Sequence<Throwable> = sequence {
     }
 }
 
-private fun Throwable.userMessage(prefix: String): String = prefix
+private fun Throwable.userMessage(prefix: String, endpoint: BobEndpoint? = null): String {
+    val causes = causeChain().toList()
+    val detail = when {
+        causes.any { it is BobCertificatePinMismatchException } ->
+            "the saved certificate pin no longer matches"
+        causes.any { it is BobIdentityMismatchException || it is BobTrustConflictException } ->
+            "the computer identity does not match the discovery or trust record"
+        causes.any { it is BobCertificateValidationException } ->
+            "the computer certificate does not meet BOB security requirements"
+        causes.any { it is SSLHandshakeException } -> "the TLS handshake was rejected"
+        causes.any { it is SocketTimeoutException } -> "the connection timed out"
+        causes.any { it is ConnectException } -> "no BOB service accepted the connection"
+        causes.any { it is NoRouteToHostException } -> "the address is not reachable on this network"
+        causes.any { it is UnknownHostException } -> "the address could not be resolved"
+        causes.any { it is BobServerInfoException } -> "the BOB /info response was invalid"
+        causes.any { it is BobHttpsException } -> "the HTTPS response was not a valid BOB service response"
+        causes.any { it is IOException } -> "the network connection was interrupted"
+        else -> null
+    }
+    val target = endpoint?.let { value ->
+        val host = if (':' in value.host && !value.host.startsWith("[")) {
+            "[${value.host}]"
+        } else {
+            value.host
+        }
+        " at $host:${value.port}"
+    }.orEmpty()
+    return if (detail == null) "$prefix$target." else "$prefix$target: $detail."
+}
 
 private fun BobRemoteError.uiMessage(): String = when (code) {
     BobProtocol.ERROR_UNSUPPORTED_VERSION ->

@@ -11,6 +11,7 @@
     <Grid Margin="40,32,40,32">
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
             <RowDefinition Height="*" />
             <RowDefinition Height="Auto" />
         </Grid.RowDefinitions>
@@ -32,29 +33,83 @@
             </StackPanel>
 
             <Border Grid.Column="1"
+                    MaxWidth="420"
                     Padding="14,10"
                     BorderBrush="{StaticResource StrokeBrush}"
                     BorderThickness="1.5"
                     CornerRadius="2">
-                <StackPanel Orientation="Horizontal">
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="*" />
+                    </Grid.ColumnDefinitions>
                     <Ellipse Width="9"
                              Height="9"
                              Margin="0,1,9,0"
+                             VerticalAlignment="Top"
                              Fill="{Binding ConnectionBrush}" />
-                    <StackPanel>
+                    <StackPanel Grid.Column="1"
+                                MaxWidth="360">
                         <TextBlock Text="{Binding ConnectionText}"
                                    FontWeight="SemiBold" />
+                        <TextBlock Text="{Binding ConnectionDetail}"
+                                   Margin="0,2,0,0"
+                                   TextWrapping="Wrap"
+                                   Foreground="{StaticResource MutedBrush}"
+                                   FontSize="12" />
                         <TextBlock Text="{Binding ServerDetails}"
                                    Margin="0,2,0,0"
                                    Foreground="{StaticResource MutedBrush}"
                                    FontSize="12" />
                     </StackPanel>
-                </StackPanel>
+                </Grid>
             </Border>
         </Grid>
 
         <Border Grid.Row="1"
-                Margin="0,32,0,24"
+                Margin="0,20,0,0"
+                Padding="14,10"
+                BorderBrush="{StaticResource StrokeBrush}"
+                BorderThickness="1.5"
+                CornerRadius="2"
+                Background="{StaticResource SurfaceBrush}">
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+
+                <StackPanel Margin="0,0,16,0">
+                    <TextBlock Text="Receive folder"
+                               FontWeight="SemiBold" />
+                    <TextBlock Text="{Binding ReceiveDirectory}"
+                               Margin="0,2,0,0"
+                               TextTrimming="CharacterEllipsis"
+                               ToolTip="{Binding ReceiveDirectory}"
+                               Foreground="{StaticResource MutedBrush}"
+                               FontSize="12" />
+                    <TextBlock Text="{Binding SettingsHint}"
+                               Margin="0,2,0,0"
+                               Foreground="{StaticResource MutedBrush}"
+                               FontSize="11" />
+                </StackPanel>
+                <Button Grid.Column="1"
+                        Padding="12,7"
+                        Content="Choose Folder"
+                        Command="{Binding ChooseReceiveDirectoryCommand}"
+                        ToolTip="Choose the folder used for future received files." />
+                <Button Grid.Column="2"
+                        Margin="8,0,0,0"
+                        Padding="12,7"
+                        Content="Open Folder"
+                        Command="{Binding OpenReceiveDirectoryCommand}"
+                        ToolTip="Open the current receive folder." />
+            </Grid>
+        </Border>
+
+        <Border Grid.Row="2"
+                Margin="0,20,0,24"
                 BorderBrush="{StaticResource StrokeBrush}"
                 BorderThickness="2"
                 CornerRadius="2"
@@ -67,7 +122,7 @@
                                HorizontalAlignment="Center"
                                FontSize="28"
                                FontWeight="Bold" />
-                    <TextBlock Text="Text from your phone will appear here once it connects. Images and files are coming next."
+                    <TextBlock Text="Text, images, and files appear here once your phone connects."
                                Margin="0,8,0,0"
                                Foreground="{StaticResource MutedBrush}"
                                FontSize="15" />
@@ -102,22 +157,55 @@
                                                Foreground="{StaticResource MutedBrush}"
                                                FontSize="12"
                                                FontWeight="SemiBold" />
-                                    <TextBlock Text="{Binding Text}"
-                                               Margin="0,5,0,6"
-                                               TextWrapping="Wrap"
-                                               FontSize="15" />
-                                    <StackPanel Orientation="Horizontal"
-                                                HorizontalAlignment="Right">
-                                        <TextBlock Text="{Binding TimeLabel}"
-                                                   Foreground="{StaticResource MutedBrush}"
-                                                   FontSize="11" />
-                                        <TextBlock Text=" · "
-                                                   Foreground="{StaticResource MutedBrush}"
-                                                   FontSize="11" />
-                                        <TextBlock Text="{Binding Status}"
-                                                   Foreground="{StaticResource MutedBrush}"
-                                                   FontSize="11" />
-                                    </StackPanel>
+                                     <TextBlock Text="{Binding Text}"
+                                                Margin="0,5,0,6"
+                                                TextWrapping="Wrap"
+                                                FontSize="15" />
+                                    <Button Margin="0,0,0,8"
+                                            MinWidth="240"
+                                            MinHeight="120"
+                                            Padding="0"
+                                            HorizontalAlignment="Stretch"
+                                            AutomationProperties.Name="View image preview"
+                                            Command="{Binding ViewImageCommand}"
+                                            Visibility="{Binding ThumbnailVisibility}"
+                                            ToolTip="View image">
+                                        <Image Source="{Binding Thumbnail}"
+                                               MaxWidth="560"
+                                               MaxHeight="240"
+                                               Stretch="Uniform" />
+                                    </Button>
+                                    <TextBlock Text="{Binding Detail}"
+                                               Margin="0,0,0,6"
+                                               Visibility="{Binding DetailVisibility}"
+                                               Foreground="{StaticResource MutedBrush}"
+                                               FontSize="12" />
+                                    <Grid>
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="Auto" />
+                                            <ColumnDefinition Width="*" />
+                                        </Grid.ColumnDefinitions>
+                                        <Button Padding="10,5"
+                                                Content="View"
+                                                AutomationProperties.Name="View full image preview"
+                                                Command="{Binding ViewImageCommand}"
+                                                Visibility="{Binding ViewImageVisibility}"
+                                                ToolTip="Open the full image." />
+                                        <StackPanel Grid.Column="1"
+                                                    Orientation="Horizontal"
+                                                    HorizontalAlignment="Right"
+                                                    VerticalAlignment="Center">
+                                            <TextBlock Text="{Binding TimeLabel}"
+                                                       Foreground="{StaticResource MutedBrush}"
+                                                       FontSize="11" />
+                                            <TextBlock Text=" · "
+                                                       Foreground="{StaticResource MutedBrush}"
+                                                       FontSize="11" />
+                                            <TextBlock Text="{Binding Status}"
+                                                       Foreground="{StaticResource MutedBrush}"
+                                                       FontSize="11" />
+                                        </StackPanel>
+                                    </Grid>
                                 </StackPanel>
                             </Border>
                         </DataTemplate>
@@ -126,7 +214,7 @@
             </Grid>
         </Border>
 
-        <Grid Grid.Row="2">
+        <Grid Grid.Row="3">
             <Grid.RowDefinitions>
                 <RowDefinition Height="Auto" />
                 <RowDefinition Height="Auto" />
@@ -149,13 +237,13 @@
                 </Grid.ColumnDefinitions>
 
                 <Button Content="Choose Image"
-                        IsEnabled="False"
-                        ToolTip="Image and file transfers are coming soon." />
+                        Command="{Binding ChooseImageCommand}"
+                        ToolTip="Choose one or more images to send." />
                 <Button Grid.Column="1"
                         Margin="8,0,0,0"
                         Content="Choose File"
-                        IsEnabled="False"
-                        ToolTip="Image and file transfers are coming soon." />
+                        Command="{Binding ChooseFileCommand}"
+                        ToolTip="Choose one or more files to send." />
                 <TextBlock Grid.Column="2"
                            Margin="14,0"
                            VerticalAlignment="Center"

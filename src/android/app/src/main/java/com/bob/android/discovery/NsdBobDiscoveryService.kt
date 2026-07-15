@@ -1,11 +1,11 @@
 package com.bob.android.discovery
 
 import android.content.Context
+import android.net.ConnectivityManager
 import android.net.Network
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
 import androidx.annotation.MainThread
-import java.net.Inet4Address
 import java.util.Locale
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -15,6 +15,9 @@ import kotlinx.coroutines.flow.asStateFlow
 @MainThread
 class NsdBobDiscoveryService(context: Context) : AutoCloseable {
     private val nsdManager = requireNotNull(context.getSystemService(NsdManager::class.java))
+    private val connectivityManager = requireNotNull(
+        context.getSystemService(ConnectivityManager::class.java),
+    )
     private val callbackExecutor = context.mainExecutor
     private val resolvedByServiceName = linkedMapOf<String, DiscoveredComputer>()
     private val infoCallbacks = mutableMapOf<String, NsdManager.ServiceInfoCallback>()
@@ -188,10 +191,18 @@ class NsdBobDiscoveryService(context: Context) : AutoCloseable {
     }
 
     private fun upsertResolvedService(serviceInfo: NsdServiceInfo) {
-        val address = serviceInfo.hostAddresses.firstOrNull { it is Inet4Address }
-            ?: serviceInfo.hostAddresses.firstOrNull()
-            ?: return
-        val host = address.hostAddress ?: return
+        val localPrefixes = serviceInfo.network
+            ?.let(connectivityManager::getLinkProperties)
+            ?.linkAddresses
+            .orEmpty()
+            .map { linkAddress ->
+                BobNetworkPrefix(
+                    addressBytes = linkAddress.address.address,
+                    prefixLength = linkAddress.prefixLength,
+                )
+            }
+        val hosts = rankBobAddressCandidates(serviceInfo.hostAddresses, localPrefixes)
+        if (hosts.isEmpty()) return
         val serviceName = serviceInfo.serviceName.takeIf(String::isNotBlank) ?: return
         if (serviceInfo.port !in 1..65535) return
 
@@ -209,7 +220,7 @@ class NsdBobDiscoveryService(context: Context) : AutoCloseable {
             serviceName = serviceName,
             deviceId = deviceId,
             displayName = displayName,
-            host = host,
+            hosts = hosts,
             port = serviceInfo.port,
             protocolVersion = protocolVersion,
             apiPath = apiPath,

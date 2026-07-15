@@ -5,7 +5,9 @@ namespace Bob.Windows.Transport;
 
 public sealed record ConnectionSnapshot(
     SessionPhase Phase,
-    string? PeerName)
+    string? PeerName,
+    string Detail,
+    long Revision)
 {
     public bool IsConnected => Phase == SessionPhase.Connected;
 }
@@ -30,6 +32,8 @@ public sealed class SessionCoordinator
     private readonly Dictionary<Guid, IncomingText> _receivedTexts = new();
     private SessionConnection? _active;
     private string? _peerName;
+    private string _detail = $"BOB server is ready on port {BobProtocol.DefaultPort}.";
+    private long _revision;
 
     public event EventHandler<ConnectionSnapshot>? ConnectionChanged;
 
@@ -62,6 +66,8 @@ public sealed class SessionCoordinator
 
             _active = new SessionConnection(socket);
             _stateMachine.BeginHandshake();
+            _detail = "Secure WebSocket opened; waiting for Android hello.";
+            _revision += 1;
             lease = new SessionLease(this, _active);
             snapshot = CreateSnapshot();
         }
@@ -76,6 +82,21 @@ public sealed class SessionCoordinator
         DateTimeOffset createdAt,
         CancellationToken cancellationToken = default)
     {
+        var envelope = ProtocolJson.Create(
+            "text.send",
+            new
+            {
+                textId,
+                text,
+                createdAt
+            });
+        await SendEnvelopeAsync(envelope, cancellationToken);
+    }
+
+    public async Task SendEnvelopeAsync(
+        ProtocolEnvelope envelope,
+        CancellationToken cancellationToken = default)
+    {
         SessionConnection connection;
 
         lock (_sync)
@@ -88,15 +109,35 @@ public sealed class SessionCoordinator
             connection = _active;
         }
 
-        var envelope = ProtocolJson.Create(
-            "text.send",
-            new
-            {
-                textId,
-                text,
-                createdAt
-            });
         await connection.SendAsync(envelope, cancellationToken);
+    }
+
+    public async Task<bool> SendNextTransferOfferAsync(
+        TransferCoordinator transfers,
+        CancellationToken cancellationToken = default)
+    {
+        var offer = transfers.TryOfferNextOutgoing();
+        if (offer is null)
+        {
+            return false;
+        }
+
+        try
+        {
+            await SendEnvelopeAsync(
+                TransferProtocolMessages.Offer(offer),
+                cancellationToken);
+            return true;
+        }
+        catch
+        {
+            transfers.FailLocal(
+                offer.TransferId,
+                "network_interrupted",
+                "The transfer offer could not be sent.",
+                retryable: true);
+            throw;
+        }
     }
 
     internal void CompleteHandshake(SessionLease lease, string peerName)
@@ -108,6 +149,8 @@ public sealed class SessionCoordinator
             EnsureCurrent(lease);
             _peerName = peerName;
             _stateMachine.CompleteHandshake();
+            _detail = "Secure WSS session active.";
+            _revision += 1;
             snapshot = CreateSnapshot();
         }
 
@@ -150,9 +193,15 @@ public sealed class SessionCoordinator
         {
             if (ReferenceEquals(_active, lease.Connection))
             {
+                var wasConnected = _stateMachine.Phase == SessionPhase.Connected;
                 _active = null;
                 _peerName = null;
                 _stateMachine.Reset();
+                _detail = lease.DisconnectReason
+                    ?? (wasConnected
+                        ? "Phone disconnected."
+                        : "Phone connection ended before verification completed.");
+                _revision += 1;
                 snapshot = CreateSnapshot();
             }
         }
@@ -164,7 +213,7 @@ public sealed class SessionCoordinator
     }
 
     private ConnectionSnapshot CreateSnapshot() =>
-        new(_stateMachine.Phase, _peerName);
+        new(_stateMachine.Phase, _peerName, _detail, _revision);
 
     private void EnsureCurrent(SessionLease lease)
     {
@@ -258,6 +307,8 @@ internal sealed class SessionLease : IDisposable
 
     internal SessionCoordinator.SessionConnection Connection { get; }
 
+    internal string? DisconnectReason { get; private set; }
+
     public WebSocket Socket => Connection.Socket;
 
     public Task SendAsync(
@@ -273,6 +324,14 @@ internal sealed class SessionLease : IDisposable
 
     public void CompleteHandshake(string peerName) =>
         _owner.CompleteHandshake(this, peerName);
+
+    public void SetDisconnectReason(string reason)
+    {
+        if (!string.IsNullOrWhiteSpace(reason))
+        {
+            DisconnectReason = reason;
+        }
+    }
 
     public void Dispose()
     {

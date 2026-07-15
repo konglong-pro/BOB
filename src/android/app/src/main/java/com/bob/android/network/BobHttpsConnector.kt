@@ -2,9 +2,9 @@ package com.bob.android.network
 
 import android.content.Context
 import com.bob.android.security.BobCertificatePin
-import com.bob.android.security.BobCertificateProfileValidator
 import com.bob.android.security.BobHttpsException
 import com.bob.android.security.BobIdentityMismatchException
+import com.bob.android.security.BobObservedPinTrustManager
 import com.bob.android.security.BobPinnedTrustManager
 import com.bob.android.security.BobProbeTrustManager
 import com.bob.android.security.BobServerInfoException
@@ -17,13 +17,13 @@ import java.nio.ByteBuffer
 import java.nio.charset.CodingErrorAction
 import java.nio.charset.StandardCharsets
 import java.security.SecureRandom
-import java.security.cert.X509Certificate
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.TimeUnit
 import javax.net.ssl.SSLContext
 import javax.net.ssl.X509TrustManager
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.suspendCancellableCoroutine
@@ -74,7 +74,11 @@ class BobHttpsConnector(
                 undelivered.compareAndSet(delivered, null)
             }
         } finally {
-            undelivered.getAndSet(null)?.close()
+            undelivered.getAndSet(null)?.let { orphanedConnection ->
+                withContext(Dispatchers.IO + NonCancellable) {
+                    orphanedConnection.close()
+                }
+            }
         }
     }
 
@@ -84,11 +88,14 @@ class BobHttpsConnector(
     fun resetTrust(serverId: UUID): Boolean = trustStore.reset(serverId)
 
     private suspend fun probeAndEstablishStrict(endpoint: BobEndpoint): BobHttpsConnection {
-        val probeClient = buildClientOnIo(endpoint, BobProbeTrustManager(), isProbe = true)
+        val trustManager = BobProbeTrustManager()
+        val probeClient = buildClientOnIo(endpoint, trustManager, isProbe = true)
         val observation = try {
-            fetchInfo(probeClient, endpoint)
+            fetchInfo(probeClient, endpoint, trustManager)
         } finally {
-            probeClient.shutdown()
+            withContext(Dispatchers.IO + NonCancellable) {
+                probeClient.shutdown()
+            }
         }
         currentCoroutineContext().ensureActive()
 
@@ -120,16 +127,17 @@ class BobHttpsConnector(
             }
         }
 
+        val trustManager = BobPinnedTrustManager(
+            expectedPin = trustRecord.certificatePin,
+            serverId = trustRecord.serverId,
+        )
         val strictClient = buildClientOnIo(
             endpoint = endpoint,
-            trustManager = BobPinnedTrustManager(
-                expectedPin = trustRecord.certificatePin,
-                serverId = trustRecord.serverId,
-            ),
+            trustManager = trustManager,
             isProbe = false,
         )
         try {
-            val observation = fetchInfo(strictClient, endpoint)
+            val observation = fetchInfo(strictClient, endpoint, trustManager)
             if (!BobCertificatePin.matches(trustRecord.certificatePin, observation.certificatePin)) {
                 throw BobHttpsException("Strict BOB response did not use the saved certificate pin.")
             }
@@ -160,7 +168,9 @@ class BobHttpsConnector(
                 client = strictClient,
             )
         } catch (error: Throwable) {
-            strictClient.shutdown()
+            withContext(Dispatchers.IO + NonCancellable) {
+                strictClient.shutdown()
+            }
             throw error
         }
     }
@@ -211,11 +221,19 @@ class BobHttpsConnector(
             undelivered.compareAndSet(client, null)
             return client
         } finally {
-            undelivered.getAndSet(null)?.shutdown()
+            undelivered.getAndSet(null)?.let { orphanedClient ->
+                withContext(Dispatchers.IO + NonCancellable) {
+                    orphanedClient.shutdown()
+                }
+            }
         }
     }
 
-    private suspend fun fetchInfo(client: OkHttpClient, endpoint: BobEndpoint): InfoObservation {
+    private suspend fun fetchInfo(
+        client: OkHttpClient,
+        endpoint: BobEndpoint,
+        trustManager: BobObservedPinTrustManager,
+    ): InfoObservation {
         val request = Request.Builder()
             .url(endpoint.infoUrl())
             .get()
@@ -224,26 +242,34 @@ class BobHttpsConnector(
             .build()
 
         val response = client.newCall(request).awaitResponse()
-        return response.use { securedResponse ->
-            withContext(Dispatchers.IO) { parseInfoResponse(securedResponse) }
+        return try {
+            withContext(Dispatchers.IO) {
+                parseInfoResponse(response, trustManager)
+            }
+        } finally {
+            withContext(Dispatchers.IO + NonCancellable) {
+                response.close()
+            }
         }
     }
 
-    private fun parseInfoResponse(response: Response): InfoObservation {
+    private fun parseInfoResponse(
+        response: Response,
+        trustManager: BobObservedPinTrustManager,
+    ): InfoObservation {
             if (response.code != 200) {
                 throw BobHttpsException("BOB /info returned HTTP ${response.code}.")
             }
             validateContentType(response)
 
-            val peerCertificates = response.handshake?.peerCertificates
-                ?: throw BobHttpsException("BOB /info response has no TLS handshake.")
-            if (peerCertificates.size != 1 || peerCertificates.single() !is X509Certificate) {
-                throw BobHttpsException("BOB /info response did not use one X.509 certificate.")
+            if (response.handshake == null) {
+                throw BobHttpsException("BOB /info response has no TLS handshake.")
             }
-            val leaf = peerCertificates.single() as X509Certificate
-            // Bind the pin to this response, not to a separate preflight socket.
-            BobCertificateProfileValidator.validate(arrayOf(leaf))
-            val pin = BobCertificatePin.fromCertificate(leaf)
+            // OkHttp's cleaned peer-certificate view can be empty with a custom Android trust
+            // manager. The dedicated manager records the full-DER pin while validating the raw
+            // chain for this client's only in-flight /info request.
+            val pin = trustManager.observedServerPin
+                ?: throw BobHttpsException("BOB /info TLS certificate was not observed.")
 
             val body = response.body
             val json = decodeUtf8(readBounded(body.byteStream()))

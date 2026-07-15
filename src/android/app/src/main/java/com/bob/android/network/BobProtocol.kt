@@ -108,6 +108,126 @@ object BobProtocol {
         )
     }
 
+    fun transferOffer(
+        transferId: UUID,
+        retryOf: UUID?,
+        kind: BobTransferKind,
+        name: String,
+        size: Long?,
+        mediaType: String,
+        createdAt: Instant,
+        envelopeId: UUID = UUID.randomUUID(),
+        sentAt: Instant = Instant.now(),
+    ): BobEnvelope {
+        require(transferId != EmptyUuid)
+        require(retryOf != EmptyUuid)
+        require(name.isNotBlank())
+        require(size == null || size >= 0L)
+        require(mediaType.isNotBlank())
+        return envelope(
+            type = "transfer.offer",
+            id = envelopeId,
+            sentAt = sentAt,
+            payload = JSONObject()
+                .put("transferId", transferId.toString())
+                .put("retryOf", retryOf?.toString() ?: JSONObject.NULL)
+                .put("kind", kind.wireValue)
+                .put("name", name)
+                .put("size", size ?: JSONObject.NULL)
+                .put("mediaType", mediaType)
+                .put("createdAt", createdAt.toString()),
+        )
+    }
+
+    fun transferAccepted(
+        transferId: UUID,
+        plannedName: String,
+        replyTo: UUID? = null,
+    ): BobEnvelope = envelope(
+        type = "transfer.accepted",
+        id = UUID.randomUUID(),
+        sentAt = Instant.now(),
+        replyTo = replyTo,
+        payload = JSONObject()
+            .put("transferId", transferId.toString())
+            .put("plannedName", plannedName),
+    )
+
+    fun transferDigest(
+        transferId: UUID,
+        sha256: String,
+        bytes: Long,
+    ): BobEnvelope = envelope(
+        type = "transfer.digest",
+        id = UUID.randomUUID(),
+        sentAt = Instant.now(),
+        payload = JSONObject()
+            .put("transferId", transferId.toString())
+            .put("algorithm", "sha-256")
+            .put("value", sha256)
+            .put("bytes", bytes),
+    )
+
+    fun transferProgress(
+        transferId: UUID,
+        bytes: Long,
+        total: Long?,
+    ): BobEnvelope = envelope(
+        type = "transfer.progress",
+        id = UUID.randomUUID(),
+        sentAt = Instant.now(),
+        payload = JSONObject()
+            .put("transferId", transferId.toString())
+            .put("bytes", bytes)
+            .put("total", total ?: JSONObject.NULL),
+    )
+
+    fun transferCompleted(
+        transferId: UUID,
+        bytes: Long,
+        sha256: String,
+        storedName: String,
+        completedAt: Instant = Instant.now(),
+    ): BobEnvelope = envelope(
+        type = "transfer.completed",
+        id = UUID.randomUUID(),
+        sentAt = Instant.now(),
+        payload = JSONObject()
+            .put("transferId", transferId.toString())
+            .put("bytes", bytes)
+            .put("sha256", sha256)
+            .put("storedName", storedName)
+            .put("completedAt", completedAt.toString()),
+    )
+
+    fun transferTerminalAck(
+        transferId: UUID,
+        state: BobTransferTerminalState,
+    ): BobEnvelope = envelope(
+        type = "transfer.terminalAck",
+        id = UUID.randomUUID(),
+        sentAt = Instant.now(),
+        payload = JSONObject()
+            .put("transferId", transferId.toString())
+            .put("state", state.wireValue),
+    )
+
+    fun transferFailed(
+        transferId: UUID,
+        code: String,
+        message: String,
+        retryable: Boolean,
+    ): BobEnvelope = envelope(
+        type = "transfer.failed",
+        id = UUID.randomUUID(),
+        sentAt = Instant.now(),
+        payload = JSONObject()
+            .put("transferId", transferId.toString())
+            .put("code", code)
+            .put("message", truncateUtf8(message, 4 * 1024))
+            .put("retryable", retryable),
+    )
+
     fun error(
         code: String,
         message: String,
@@ -262,6 +382,116 @@ object BobProtocol {
         )
     }
 
+    fun parseTransferOffer(envelope: BobEnvelope): BobTransferOffer {
+        requireType(envelope, "transfer.offer")
+        val payload = envelope.payload
+        val kind = BobTransferKind.fromWire(requiredString(payload, "kind"))
+        val name = requiredString(payload, "name")
+        if (name.isBlank()) throw invalid("transfer name cannot be blank")
+        val size = optionalLong(payload, "size")
+        if (size != null && size < 0L) throw invalid("transfer size cannot be negative")
+        val mediaType = requiredString(payload, "mediaType")
+        if (mediaType.isBlank()) throw invalid("mediaType cannot be blank")
+        return BobTransferOffer(
+            envelopeId = envelope.id,
+            transferId = requiredUuid(payload, "transferId"),
+            retryOf = optionalUuid(payload, "retryOf"),
+            kind = kind,
+            name = name,
+            size = size,
+            mediaType = mediaType,
+            createdAt = requiredUtcInstant(payload, "createdAt"),
+        )
+    }
+
+    fun parseTransferAccepted(envelope: BobEnvelope): BobTransferAccepted {
+        requireType(envelope, "transfer.accepted")
+        val payload = envelope.payload
+        val plannedName = requiredString(payload, "plannedName")
+        if (plannedName.isBlank()) throw invalid("plannedName cannot be blank")
+        return BobTransferAccepted(
+            envelopeId = envelope.id,
+            replyTo = envelope.replyTo,
+            transferId = requiredUuid(payload, "transferId"),
+            plannedName = plannedName,
+        )
+    }
+
+    fun parseTransferDigest(envelope: BobEnvelope): BobTransferDigest {
+        requireType(envelope, "transfer.digest")
+        val payload = envelope.payload
+        val algorithm = requiredString(payload, "algorithm")
+        val value = requiredString(payload, "value")
+        val bytes = requiredLong(payload, "bytes")
+        if (bytes < 0L || value.isBlank()) throw invalid("transfer digest is invalid")
+        return BobTransferDigest(
+            envelopeId = envelope.id,
+            transferId = requiredUuid(payload, "transferId"),
+            algorithm = algorithm,
+            value = value,
+            bytes = bytes,
+        )
+    }
+
+    fun parseTransferCompleted(envelope: BobEnvelope): BobTransferCompleted {
+        requireType(envelope, "transfer.completed")
+        val payload = envelope.payload
+        val bytes = requiredLong(payload, "bytes")
+        val sha256 = requiredString(payload, "sha256")
+        val storedName = requiredString(payload, "storedName")
+        if (bytes < 0L || sha256.isBlank() || storedName.isBlank()) {
+            throw invalid("transfer.completed payload is invalid")
+        }
+        return BobTransferCompleted(
+            envelopeId = envelope.id,
+            transferId = requiredUuid(payload, "transferId"),
+            bytes = bytes,
+            sha256 = sha256,
+            storedName = storedName,
+            completedAt = requiredUtcInstant(payload, "completedAt"),
+        )
+    }
+
+    fun parseTransferTerminalAck(envelope: BobEnvelope): BobTransferTerminalAck {
+        requireType(envelope, "transfer.terminalAck")
+        val payload = envelope.payload
+        return BobTransferTerminalAck(
+            envelopeId = envelope.id,
+            transferId = requiredUuid(payload, "transferId"),
+            state = BobTransferTerminalState.fromWire(requiredString(payload, "state")),
+        )
+    }
+
+    fun parseTransferFailed(envelope: BobEnvelope): BobTransferFailed {
+        requireType(envelope, "transfer.failed")
+        val payload = envelope.payload
+        val code = requiredString(payload, "code")
+        val message = requiredString(payload, "message")
+        if (code.isBlank() || utf8Size(message) > 4 * 1024) {
+            throw invalid("transfer.failed payload is invalid")
+        }
+        return BobTransferFailed(
+            envelopeId = envelope.id,
+            transferId = requiredUuid(payload, "transferId"),
+            code = code,
+            message = message,
+            retryable = requiredBoolean(payload, "retryable"),
+        )
+    }
+
+    fun parseTransferProgress(envelope: BobEnvelope): BobTransferProgress {
+        requireType(envelope, "transfer.progress")
+        val payload = envelope.payload
+        val bytes = requiredLong(payload, "bytes")
+        val total = optionalLong(payload, "total")
+        if (bytes < 0L || (total != null && total < 0L)) throw invalid("transfer progress is invalid")
+        return BobTransferProgress(
+            transferId = requiredUuid(payload, "transferId"),
+            bytes = bytes,
+            total = total,
+        )
+    }
+
     fun parseError(envelope: BobEnvelope): BobRemoteError {
         if (envelope.version != VERSION || envelope.type != "error") throw invalid("Expected error v1")
         val payload = envelope.payload
@@ -277,6 +507,21 @@ object BobProtocol {
     }
 
     internal fun utf8Size(value: String): Int = value.toByteArray(StandardCharsets.UTF_8).size
+
+    private fun truncateUtf8(value: String, maximumBytes: Int): String {
+        if (utf8Size(value) <= maximumBytes) return value
+        val output = StringBuilder()
+        var bytes = 0
+        value.codePoints().forEach { codePoint ->
+            val text = String(Character.toChars(codePoint))
+            val encodedBytes = utf8Size(text)
+            if (bytes + encodedBytes <= maximumBytes) {
+                output.append(text)
+                bytes += encodedBytes
+            }
+        }
+        return output.toString()
+    }
 
     private fun envelope(
         type: String,
@@ -308,6 +553,29 @@ object BobProtocol {
                 ?: throw invalid("$key is outside int32")
             else -> throw invalid("$key must be an integer")
         }
+
+    private fun requiredLong(parent: JSONObject, key: String): Long =
+        when (val value = parent.opt(key)) {
+            is Int -> value.toLong()
+            is Long -> value
+            else -> throw invalid("$key must be an integer")
+        }
+
+    private fun optionalLong(parent: JSONObject, key: String): Long? {
+        val value = parent.opt(key)
+        if (value == null || value === JSONObject.NULL) return null
+        return when (value) {
+            is Int -> value.toLong()
+            is Long -> value
+            else -> throw invalid("$key must be an integer or null")
+        }
+    }
+
+    private fun requireType(envelope: BobEnvelope, type: String) {
+        if (envelope.version != VERSION || envelope.type != type) {
+            throw invalid("Expected $type v1")
+        }
+    }
 
     private fun requiredUuid(parent: JSONObject, key: String): UUID {
         val value = requiredString(parent, key)
@@ -392,6 +660,85 @@ data class BobTextAcknowledgement(
     val replyTo: UUID?,
     val textId: UUID,
     val storedAt: Instant,
+)
+
+enum class BobTransferKind(val wireValue: String) {
+    File("file"),
+    Image("image"),
+    ;
+
+    companion object {
+        fun fromWire(value: String): BobTransferKind = entries.firstOrNull { it.wireValue == value }
+            ?: throw BobProtocolException(BobProtocol.ERROR_INVALID_MESSAGE, "Unsupported transfer kind")
+    }
+}
+
+enum class BobTransferTerminalState(val wireValue: String) {
+    Completed("completed"),
+    Failed("failed"),
+    Canceled("canceled"),
+    ;
+
+    companion object {
+        fun fromWire(value: String): BobTransferTerminalState = entries.firstOrNull {
+            it.wireValue == value
+        } ?: throw BobProtocolException(BobProtocol.ERROR_INVALID_MESSAGE, "Invalid terminal state")
+    }
+}
+
+data class BobTransferOffer(
+    val envelopeId: UUID,
+    val transferId: UUID,
+    val retryOf: UUID?,
+    val kind: BobTransferKind,
+    val name: String,
+    val size: Long?,
+    val mediaType: String,
+    val createdAt: Instant,
+)
+
+data class BobTransferAccepted(
+    val envelopeId: UUID,
+    val replyTo: UUID?,
+    val transferId: UUID,
+    val plannedName: String,
+)
+
+data class BobTransferDigest(
+    val envelopeId: UUID,
+    val transferId: UUID,
+    val algorithm: String,
+    val value: String,
+    val bytes: Long,
+)
+
+data class BobTransferCompleted(
+    val envelopeId: UUID,
+    val transferId: UUID,
+    val bytes: Long,
+    val sha256: String,
+    val storedName: String,
+    val completedAt: Instant,
+)
+
+data class BobTransferTerminalAck(
+    val envelopeId: UUID,
+    val transferId: UUID,
+    val state: BobTransferTerminalState,
+)
+
+data class BobTransferFailed(
+    val envelopeId: UUID,
+    val transferId: UUID,
+    val code: String,
+    val message: String,
+    val retryable: Boolean,
+)
+
+data class BobTransferProgress(
+    val transferId: UUID,
+    val bytes: Long,
+    val total: Long?,
 )
 
 data class BobRemoteError(
