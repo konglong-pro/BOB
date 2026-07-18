@@ -2,6 +2,7 @@ using System.Security.Authentication;
 using System.Threading;
 using System.Windows;
 using Bob.Windows.Discovery;
+using Bob.Windows.Persistence;
 using Bob.Windows.Security;
 using Bob.Windows.Storage;
 using Bob.Windows.Transport;
@@ -72,6 +73,7 @@ public partial class App : Application
             builder.Services.AddSingleton(paths);
             builder.Services.AddSingleton(identity);
             builder.Services.AddHostedService<MdnsAdvertisementService>();
+            builder.Services.AddSingleton<TextHistoryStore>();
             builder.Services.AddSingleton<SessionCoordinator>();
             builder.Services.AddSingleton<ReceiveDirectorySettings>();
             builder.Services.AddSingleton<TransferCoordinator>();

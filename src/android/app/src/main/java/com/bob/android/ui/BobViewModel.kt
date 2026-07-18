@@ -350,9 +350,13 @@ class BobViewModel(application: Application) : AndroidViewModel(application) {
         }
         val activeServerId = connectionState.serverId?.toString()
         val timeline = if (activeServerId == null) {
-            messages.asReversed().map(::toTimelineItem)
+            messages.asReversed().take(RECENT_MESSAGE_LIMIT).map(::toTimelineItem)
         } else {
-            messages.filter { it.serverId == activeServerId }.asReversed().map(::toTimelineItem)
+            messages
+                .filter { it.serverId == activeServerId }
+                .asReversed()
+                .take(RECENT_MESSAGE_LIMIT)
+                .map(::toTimelineItem)
         }
         val connectionPresentation = presentConnection(connectionState, selection != null)
         val busy = connectionState.phase in setOf(
@@ -602,6 +606,7 @@ class BobViewModel(application: Application) : AndroidViewModel(application) {
         const val MAX_MANUAL_IP_LENGTH = 64
         const val MAX_DRAFT_CHARACTERS = 300_000
         const val MAX_TIMELINE_PREVIEW_CHARS = 1_200
+        const val RECENT_MESSAGE_LIMIT = 20
         const val BACKGROUND_DISCONNECT_DELAY_MILLIS = 2_000L
         const val AUTOMATIC_CONNECT_SETTLE_MILLIS = 1_200L
         val TIME_FORMATTER: DateTimeFormatter = DateTimeFormatter

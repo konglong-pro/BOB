@@ -6,6 +6,7 @@ using System.Text.Json;
 using Bob.Windows;
 using Bob.Windows.Discovery;
 using Bob.Windows.Domain;
+using Bob.Windows.Persistence;
 using Bob.Windows.Security;
 using Bob.Windows.Storage;
 using Bob.Windows.Transport;
@@ -21,6 +22,7 @@ var checks = new (string Name, Action Run)[]
     ("mDNS service descriptor", CheckMdnsServiceDescriptor),
     ("reserved transfer filenames", CheckReservedTransferFilenames),
     ("receive directory setting persists", CheckReceiveDirectorySettingPersists),
+    ("text history persists and exposes the latest 20 messages", CheckTextHistoryPersistence),
     ("active incoming transfer freezes its receive directory", CheckFrozenReceiveDirectory),
     ("image timeline exposes an explicit local preview", CheckImageTimelinePreview),
     ("stale transfer snapshots cannot replace completed state", CheckTransferSnapshotRevisionRace),
@@ -369,6 +371,85 @@ static void CheckFrozenReceiveDirectory()
     }
 }
 
+static void CheckTextHistoryPersistence()
+{
+    var root = CreateCheckDirectory();
+    try
+    {
+        var appRoot = Path.Combine(root, "local-app-data", "BOB");
+        var paths = new AppPaths(appRoot, Path.Combine(appRoot, "identity"));
+        var history = new TextHistoryStore(paths);
+        var firstTimestamp = DateTimeOffset.Parse("2026-07-18T01:00:00Z");
+        var ids = new List<Guid>();
+
+        for (var index = 0; index < 25; index++)
+        {
+            var textId = Guid.NewGuid();
+            ids.Add(textId);
+            var saved = history.Save(new TextHistoryRecord(
+                textId,
+                $"message-{index}",
+                firstTimestamp.AddMinutes(index),
+                firstTimestamp.AddMinutes(index),
+                Outgoing: true,
+                Status: "Delivered",
+                PeerName: "phone"));
+            Assert(saved.IsNew, "a new text history record was treated as a duplicate.");
+        }
+
+        var reloaded = new TextHistoryStore(paths);
+        Assert(reloaded.ReadAll().Count == 25, "text history did not survive a reload.");
+        var recent = reloaded.ReadRecent(20);
+        Assert(recent.Count == 20, "recent history did not return exactly 20 records.");
+        Assert(recent[0].Text == "message-5", "recent history did not drop the five oldest records from the view.");
+        Assert(recent[^1].Text == "message-24", "recent history did not keep the newest record.");
+
+        Assert(reloaded.UpdateStatus(ids[^1], "Awaiting confirmation"), "saved history status was not updated.");
+        var updated = new TextHistoryStore(paths).ReadRecent(20)[^1];
+        Assert(updated.Status == "Awaiting confirmation", "updated history status did not survive a reload.");
+
+        var duplicate = reloaded.Save(updated);
+        Assert(!duplicate.IsNew, "an identical text ID was not treated as an idempotent duplicate.");
+        var conflictRejected = false;
+        try
+        {
+            reloaded.Save(updated with { Text = "changed" });
+        }
+        catch (TextHistoryConflictException)
+        {
+            conflictRejected = true;
+        }
+        Assert(conflictRejected, "conflicting immutable text history was accepted.");
+
+        var incomingId = Guid.NewGuid();
+        reloaded.Save(new TextHistoryRecord(
+            incomingId,
+            "received-once",
+            firstTimestamp.AddHours(1),
+            firstTimestamp.AddHours(1),
+            Outgoing: false,
+            Status: "Received",
+            PeerName: "Pixel"));
+        var coordinator = new SessionCoordinator(new TextHistoryStore(paths));
+        Assert(
+            coordinator.RegisterIncomingText(
+                incomingId,
+                "received-once",
+                firstTimestamp.AddHours(1),
+                "Pixel") == IncomingTextRegistration.Duplicate,
+            "saved incoming history did not restore text ID deduplication.");
+
+        File.WriteAllText(Path.Combine(appRoot, "text-messages-v1.json"), "{not valid json");
+        Assert(
+            new TextHistoryStore(paths).ReadAll().Count == 0,
+            "corrupt text history did not recover to an empty timeline.");
+    }
+    finally
+    {
+        DeleteCheckDirectory(root);
+    }
+}
+
 static void CheckImageTimelinePreview()
 {
     var root = CreateCheckDirectory();
@@ -381,6 +462,7 @@ static void CheckImageTimelinePreview()
                 "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="));
 
         string? openedPath = null;
+        string? copiedPath = null;
         var item = new TimelineItemViewModel(
             Guid.NewGuid(),
             "pixel.png",
@@ -390,13 +472,33 @@ static void CheckImageTimelinePreview()
             peerName: "phone",
             kind: TransferKind.Image,
             localPath: imagePath,
-            openImage: path => openedPath = path);
+            openImage: path => openedPath = path,
+            copyImage: path => copiedPath = path);
 
         item.ThumbnailLoadTask.GetAwaiter().GetResult();
         Assert(item.Thumbnail is not null, "a decodable local image did not produce a thumbnail.");
         Assert(item.ViewImageCommand.CanExecute(null), "View must be enabled for an existing local image.");
         item.ViewImageCommand.Execute(null);
         Assert(openedPath == imagePath, "View did not request the decoded local image preview.");
+        Assert(item.CopyImageCommand.CanExecute(null), "Copy must be enabled for an existing local image.");
+        item.CopyImageCommand.Execute(null);
+        Assert(copiedPath == imagePath, "Copy did not request the original local image.");
+        Assert(
+            TimelineItemViewModel.LoadClipboardImage(imagePath) is not null,
+            "a decodable image could not be loaded for clipboard copying.");
+
+        string? copiedText = null;
+        var textItem = new TimelineItemViewModel(
+            Guid.NewGuid(),
+            "copy all of this",
+            DateTimeOffset.UtcNow,
+            outgoing: false,
+            status: "Received",
+            peerName: "phone",
+            copyText: value => copiedText = value);
+        Assert(textItem.CopyTextCommand.CanExecute(null), "Copy must be enabled for a text message.");
+        textItem.CopyTextCommand.Execute(null);
+        Assert(copiedText == "copy all of this", "Copy did not expose the full text body.");
         using (new FileStream(imagePath, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
         {
         }

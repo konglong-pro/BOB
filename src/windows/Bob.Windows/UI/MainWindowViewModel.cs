@@ -2,11 +2,13 @@ using System.Collections.ObjectModel;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Windows;
 using System.Windows.Media;
 using System.Windows.Input;
 using Bob.Windows.Domain;
+using Bob.Windows.Persistence;
 using Bob.Windows.Security;
 using Bob.Windows.Storage;
 using Bob.Windows.Transport;
@@ -16,17 +18,20 @@ namespace Bob.Windows.UI;
 
 public sealed class MainWindowViewModel : INotifyPropertyChanged
 {
+    private const int VisibleTextHistoryLimit = 20;
     private static readonly Brush ConnectedBrush = Freeze("#276B45");
     private static readonly Brush WaitingBrush = Freeze("#7A4D00");
     private readonly SessionCoordinator _sessions;
     private readonly TransferCoordinator _transfers;
     private readonly ReceiveDirectorySettings _receiveDirectorySettings;
+    private readonly TextHistoryStore _textHistory;
     private readonly AsyncRelayCommand _sendTextCommand;
     private readonly AsyncRelayCommand _chooseImageCommand;
     private readonly AsyncRelayCommand _chooseFileCommand;
     private readonly AsyncRelayCommand _chooseReceiveDirectoryCommand;
     private readonly AsyncRelayCommand _openReceiveDirectoryCommand;
     private readonly Dictionary<Guid, TimelineItemViewModel> _outgoing = new();
+    private readonly Dictionary<Guid, TimelineItemViewModel> _textItems = new();
     private readonly Dictionary<Guid, TimelineItemViewModel> _transferItems = new();
     private readonly Dictionary<Guid, long> _transferRevisions = new();
     private string _draftText = string.Empty;
@@ -41,11 +46,13 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged
         SessionCoordinator sessions,
         TransferCoordinator transfers,
         ReceiveDirectorySettings receiveDirectorySettings,
+        TextHistoryStore textHistory,
         ServerIdentity identity)
     {
         _sessions = sessions;
         _transfers = transfers;
         _receiveDirectorySettings = receiveDirectorySettings;
+        _textHistory = textHistory;
         ServerDetails = $"HTTPS :{BobProtocol.DefaultPort} · {identity.CertificatePin[..10]}…";
         _sendTextCommand = new AsyncRelayCommand(SendTextAsync, CanSendText);
         _chooseImageCommand = new AsyncRelayCommand(ChooseImagesAsync, CanChooseFiles);
@@ -61,6 +68,10 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged
         sessions.TextReceived += OnTextReceived;
         sessions.TextAcknowledged += OnTextAcknowledged;
         transfers.TransferChanged += OnTransferChanged;
+        foreach (var record in textHistory.ReadRecent(VisibleTextHistoryLimit))
+        {
+            AddVisibleTextItem(CreateTextItem(record));
+        }
         ApplyConnectionSnapshot(sessions.Snapshot);
     }
 
@@ -268,11 +279,28 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged
             createdAt,
             outgoing: true,
             status: "Sending",
-            peerName: _sessions.Snapshot.PeerName ?? "phone");
+            peerName: _sessions.Snapshot.PeerName ?? "phone",
+            copyText: CopyTextToClipboard);
 
-        Timeline.Add(item);
+        try
+        {
+            _textHistory.Save(new TextHistoryRecord(
+                textId,
+                text,
+                createdAt,
+                DateTimeOffset.UtcNow,
+                Outgoing: true,
+                Status: item.Status,
+                PeerName: item.PeerName));
+        }
+        catch (TextHistoryStoreException)
+        {
+            ComposerHint = "BOB could not save this text to history, so it was not sent.";
+            return;
+        }
+
+        AddVisibleTextItem(item);
         _outgoing[textId] = item;
-        OnPropertyChanged(nameof(EmptyStateVisibility));
         DraftText = string.Empty;
 
         try
@@ -281,6 +309,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged
             if (_outgoing.ContainsKey(textId))
             {
                 item.Status = "Awaiting confirmation";
+                TryUpdateHistoryStatus(textId, item.Status);
             }
         }
         catch (Exception exception) when (
@@ -291,6 +320,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged
             if (_outgoing.Remove(textId))
             {
                 item.Status = "Failed to send";
+                TryUpdateHistoryStatus(textId, item.Status);
                 ComposerHint = "Could not send text. Check the connection and try again.";
             }
         }
@@ -333,17 +363,14 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged
     }
 
     private void OnTextReceived(object? sender, IncomingText incoming) =>
-        Dispatch(() =>
-        {
-            Timeline.Add(new TimelineItemViewModel(
-                incoming.TextId,
-                incoming.Text,
-                incoming.CreatedAt,
-                outgoing: false,
-                status: "Received",
-                peerName: incoming.PeerName));
-            OnPropertyChanged(nameof(EmptyStateVisibility));
-        });
+        Dispatch(() => AddVisibleTextItem(new TimelineItemViewModel(
+            incoming.TextId,
+            incoming.Text,
+            incoming.CreatedAt,
+            outgoing: false,
+            status: "Received",
+            peerName: incoming.PeerName,
+            copyText: CopyTextToClipboard)));
 
     private void OnTextAcknowledged(object? sender, Guid textId) =>
         Dispatch(() =>
@@ -351,6 +378,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged
             if (_outgoing.TryGetValue(textId, out var item))
             {
                 item.Status = "Delivered";
+                TryUpdateHistoryStatus(textId, item.Status);
                 _outgoing.Remove(textId);
             }
         });
@@ -381,7 +409,8 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged
                 detail: detail,
                 kind: snapshot.Kind,
                 localPath: snapshot.LocalPath,
-                openImage: ShowImagePreview);
+                openImage: ShowImagePreview,
+                copyImage: CopyImageToClipboard);
             _transferItems.Add(snapshot.TransferId, item);
             Timeline.Add(item);
             OnPropertyChanged(nameof(EmptyStateVisibility));
@@ -425,6 +454,89 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged
                 or InvalidOperationException)
         {
             ComposerHint = "BOB could not show this image preview.";
+        }
+    }
+
+    private void CopyTextToClipboard(string text)
+    {
+        try
+        {
+            Clipboard.SetText(text);
+            ComposerHint = "Text copied to the clipboard.";
+        }
+        catch (Exception exception) when (
+            exception is COMException
+                or InvalidOperationException
+                or ArgumentException)
+        {
+            ComposerHint = "BOB could not access the clipboard. Try again.";
+        }
+    }
+
+    private async void CopyImageToClipboard(string path)
+    {
+        try
+        {
+            var image = await Task.Run(
+                () => TimelineItemViewModel.LoadClipboardImage(path));
+            if (image is null)
+            {
+                ComposerHint = "BOB could not decode this image for copying.";
+                return;
+            }
+
+            Clipboard.SetImage(image);
+            ComposerHint = "Image copied to the clipboard.";
+        }
+        catch (Exception exception) when (
+            exception is IOException
+                or UnauthorizedAccessException
+                or COMException
+                or InvalidOperationException
+                or ArgumentException
+                or OutOfMemoryException)
+        {
+            ComposerHint = "BOB could not copy this image. Try again.";
+        }
+    }
+
+    private TimelineItemViewModel CreateTextItem(TextHistoryRecord record) =>
+        new(
+            record.TextId,
+            record.Text,
+            record.CreatedAt,
+            record.Outgoing,
+            record.Status,
+            record.PeerName,
+            copyText: CopyTextToClipboard);
+
+    private void AddVisibleTextItem(TimelineItemViewModel item)
+    {
+        if (_textItems.ContainsKey(item.TextId))
+        {
+            return;
+        }
+
+        _textItems.Add(item.TextId, item);
+        Timeline.Add(item);
+        while (Timeline.Count(candidate => candidate.IsText) > VisibleTextHistoryLimit)
+        {
+            var oldestVisibleText = Timeline.First(candidate => candidate.IsText);
+            Timeline.Remove(oldestVisibleText);
+        }
+
+        OnPropertyChanged(nameof(EmptyStateVisibility));
+    }
+
+    private void TryUpdateHistoryStatus(Guid textId, string status)
+    {
+        try
+        {
+            _textHistory.UpdateStatus(textId, status);
+        }
+        catch (TextHistoryStoreException)
+        {
+            ComposerHint = "The message changed state, but its history status could not be saved.";
         }
     }
 

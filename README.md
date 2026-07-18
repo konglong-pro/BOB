@@ -6,9 +6,9 @@ BOB 是一个自用的 Android 14 与 Windows 10/11 局域网双向传输工具�
 
 连接、文字与前台在线文件切片已经落地：
 
-- Windows：全英文 WPF GUI、共享像素风图标、HTTPS/WSS 服务、原生 DNS-SD、进程内文字，以及图片/文件多选、流式 PUT/GET、SHA-256、`.part`、禁止覆盖发布、图片预览和可持久配置的收件目录。
-- Android：全英文 Compose GUI、共享像素风图标、多地址局域网发现、手动 IP、受限 TOFU、严格完整证书 pin、持久文字，以及图片/文件多选、流式 PUT/GET、pending MediaStore 发布和图片预览；连接失败会显示候选地址和安全分类后的网络/TLS/WSS 原因。
-- 当前文件传输只承诺双方在线且 Android 位于前台；离线/重启恢复、锁屏前台服务、取消/重试、系统分享入口与 Windows 拖放尚未实现。Android 14 真机的最终连接、双向正文和 MediaStore 验收仍需设备接入。
+- Windows：全英文 WPF GUI、共享像素风图标、HTTPS/WSS 服务、原生 DNS-SD、原子持久文字历史（界面恢复最近 20 条），以及图片/文件多选、流式 PUT/GET、SHA-256、`.part`、禁止覆盖发布、文字/图片复制、图片预览和可持久配置的收件目录。
+- Android：全英文 Compose GUI、共享像素风图标、多地址局域网发现、手动 IP、受限 TOFU、严格完整证书 pin、持久文字（界面展示最近 20 条），以及图片/文件多选、流式 PUT/GET、pending MediaStore 发布、文字/原图复制和图片预览；连接失败会显示候选地址和安全分类后的网络/TLS/WSS 原因。
+- 当前文件传输只承诺双方在线且 Android 位于前台；离线/重启恢复、锁屏前台服务、取消/重试、系统分享入口与 Windows 拖放尚未实现。Android 14 真机连接与本切片的最近 20 条文字/复制入口已验收；双向图片正文、系统剪贴板粘贴兼容性和 MediaStore 落地仍需继续实测。
 
 ## 本地工具
 

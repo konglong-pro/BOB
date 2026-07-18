@@ -16,7 +16,11 @@ public sealed class TimelineItemViewModel : INotifyPropertyChanged
     private string? _detail;
     private readonly TransferKind? _kind;
     private readonly Action<string>? _openImage;
+    private readonly Action<string>? _copyText;
+    private readonly Action<string>? _copyImage;
     private readonly RelayCommand _viewImageCommand;
+    private readonly RelayCommand _copyTextCommand;
+    private readonly RelayCommand _copyImageCommand;
     private string? _localPath;
     private ImageSource? _thumbnail;
     private long _thumbnailRevision;
@@ -31,7 +35,9 @@ public sealed class TimelineItemViewModel : INotifyPropertyChanged
         string? detail = null,
         TransferKind? kind = null,
         string? localPath = null,
-        Action<string>? openImage = null)
+        Action<string>? openImage = null,
+        Action<string>? copyText = null,
+        Action<string>? copyImage = null)
     {
         TextId = textId;
         Text = text;
@@ -41,7 +47,11 @@ public sealed class TimelineItemViewModel : INotifyPropertyChanged
         _detail = detail;
         _kind = kind;
         _openImage = openImage;
+        _copyText = copyText;
+        _copyImage = copyImage;
         _viewImageCommand = new RelayCommand(ViewImage, CanViewImage);
+        _copyTextCommand = new RelayCommand(CopyText, CanCopyText);
+        _copyImageCommand = new RelayCommand(CopyImage, CanCopyImage);
         PeerName = peerName;
         LocalPath = localPath;
     }
@@ -66,6 +76,12 @@ public sealed class TimelineItemViewModel : INotifyPropertyChanged
     public string TimeLabel => CreatedAt.ToLocalTime().ToString("HH:mm");
 
     public ICommand ViewImageCommand => _viewImageCommand;
+
+    public ICommand CopyTextCommand => _copyTextCommand;
+
+    public ICommand CopyImageCommand => _copyImageCommand;
+
+    public bool IsText => _kind is null;
 
     internal Task ThumbnailLoadTask { get; private set; } = Task.CompletedTask;
 
@@ -122,7 +138,9 @@ public sealed class TimelineItemViewModel : INotifyPropertyChanged
                 : Task.CompletedTask;
             OnPropertyChanged();
             OnPropertyChanged(nameof(ViewImageVisibility));
+            OnPropertyChanged(nameof(CopyImageVisibility));
             _viewImageCommand.RaiseCanExecuteChanged();
+            _copyImageCommand.RaiseCanExecuteChanged();
         }
     }
 
@@ -140,7 +158,9 @@ public sealed class TimelineItemViewModel : INotifyPropertyChanged
             OnPropertyChanged();
             OnPropertyChanged(nameof(ThumbnailVisibility));
             OnPropertyChanged(nameof(ViewImageVisibility));
+            OnPropertyChanged(nameof(CopyImageVisibility));
             _viewImageCommand.RaiseCanExecuteChanged();
+            _copyImageCommand.RaiseCanExecuteChanged();
         }
     }
 
@@ -151,6 +171,25 @@ public sealed class TimelineItemViewModel : INotifyPropertyChanged
         _kind == TransferKind.Image && Thumbnail is not null
             ? Visibility.Visible
             : Visibility.Collapsed;
+
+    public Visibility CopyTextVisibility =>
+        CanCopyText() ? Visibility.Visible : Visibility.Collapsed;
+
+    public Visibility CopyImageVisibility =>
+        CanCopyImage() ? Visibility.Visible : Visibility.Collapsed;
+
+    private bool CanCopyText() =>
+        _kind is null
+        && _copyText is not null
+        && !string.IsNullOrEmpty(Text);
+
+    private void CopyText()
+    {
+        if (CanCopyText())
+        {
+            _copyText!(Text);
+        }
+    }
 
     private bool CanViewImage() =>
         _kind == TransferKind.Image
@@ -164,6 +203,21 @@ public sealed class TimelineItemViewModel : INotifyPropertyChanged
         if (CanViewImage())
         {
             _openImage!(LocalPath!);
+        }
+    }
+
+    private bool CanCopyImage() =>
+        _kind == TransferKind.Image
+        && _copyImage is not null
+        && Thumbnail is not null
+        && !string.IsNullOrWhiteSpace(LocalPath)
+        && File.Exists(LocalPath);
+
+    private void CopyImage()
+    {
+        if (CanCopyImage())
+        {
+            _copyImage!(LocalPath!);
         }
     }
 
@@ -228,6 +282,41 @@ public sealed class TimelineItemViewModel : INotifyPropertyChanged
             {
                 image.DecodePixelHeight = maximumDimension;
             }
+            image.StreamSource = stream;
+            image.EndInit();
+            image.Freeze();
+            return image;
+        }
+        catch (Exception exception) when (
+            exception is IOException
+                or UnauthorizedAccessException
+                or NotSupportedException
+                or FormatException
+                or InvalidOperationException
+                or COMException)
+        {
+            return null;
+        }
+    }
+
+    internal static BitmapSource? LoadClipboardImage(string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
+        {
+            return null;
+        }
+
+        try
+        {
+            using var stream = new FileStream(
+                path,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.ReadWrite | FileShare.Delete);
+            var image = new BitmapImage();
+            image.BeginInit();
+            image.CacheOption = BitmapCacheOption.OnLoad;
+            image.CreateOptions = BitmapCreateOptions.PreservePixelFormat;
             image.StreamSource = stream;
             image.EndInit();
             image.Freeze();

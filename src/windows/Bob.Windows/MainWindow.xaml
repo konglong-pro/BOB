@@ -115,7 +115,19 @@
                 CornerRadius="2"
                 Background="{StaticResource SurfaceBrush}">
             <Grid>
-                <StackPanel HorizontalAlignment="Center"
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="*" />
+                </Grid.RowDefinitions>
+
+                <TextBlock Margin="18,12,18,0"
+                           Text="Recent history · latest 20 messages"
+                           Foreground="{StaticResource MutedBrush}"
+                           FontSize="12"
+                           FontWeight="SemiBold" />
+
+                <StackPanel Grid.Row="1"
+                            HorizontalAlignment="Center"
                             VerticalAlignment="Center"
                             Visibility="{Binding EmptyStateVisibility}">
                     <TextBlock Text="Send something over"
@@ -128,10 +140,13 @@
                                FontSize="15" />
                 </StackPanel>
 
-                <ListBox ItemsSource="{Binding Timeline}"
-                         Margin="18"
+                <ListBox x:Name="TimelineList"
+                         Grid.Row="1"
+                         ItemsSource="{Binding Timeline}"
+                         Margin="18,12,18,18"
                          Background="Transparent"
                          BorderThickness="0"
+                         ScrollViewer.VerticalScrollBarVisibility="Auto"
                          ScrollViewer.HorizontalScrollBarVisibility="Disabled">
                     <ListBox.ItemContainerStyle>
                         <Style TargetType="ListBoxItem">
@@ -185,12 +200,27 @@
                                             <ColumnDefinition Width="Auto" />
                                             <ColumnDefinition Width="*" />
                                         </Grid.ColumnDefinitions>
-                                        <Button Padding="10,5"
-                                                Content="View"
-                                                AutomationProperties.Name="View full image preview"
-                                                Command="{Binding ViewImageCommand}"
-                                                Visibility="{Binding ViewImageVisibility}"
-                                                ToolTip="Open the full image." />
+                                        <StackPanel Orientation="Horizontal">
+                                            <Button Padding="10,5"
+                                                    Content="Copy text"
+                                                    AutomationProperties.Name="Copy full text"
+                                                    Command="{Binding CopyTextCommand}"
+                                                    Visibility="{Binding CopyTextVisibility}"
+                                                    ToolTip="Copy the full text to the clipboard." />
+                                            <Button Margin="0,0,8,0"
+                                                    Padding="10,5"
+                                                    Content="View"
+                                                    AutomationProperties.Name="View full image preview"
+                                                    Command="{Binding ViewImageCommand}"
+                                                    Visibility="{Binding ViewImageVisibility}"
+                                                    ToolTip="Open the full image." />
+                                            <Button Padding="10,5"
+                                                    Content="Copy image"
+                                                    AutomationProperties.Name="Copy image"
+                                                    Command="{Binding CopyImageCommand}"
+                                                    Visibility="{Binding CopyImageVisibility}"
+                                                    ToolTip="Copy the image to the clipboard." />
+                                        </StackPanel>
                                         <StackPanel Grid.Column="1"
                                                     Orientation="Horizontal"
                                                     HorizontalAlignment="Right"

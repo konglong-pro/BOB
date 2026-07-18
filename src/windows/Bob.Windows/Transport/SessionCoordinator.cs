@@ -1,5 +1,6 @@
 using System.Net.WebSockets;
 using Bob.Windows.Domain;
+using Bob.Windows.Persistence;
 
 namespace Bob.Windows.Transport;
 
@@ -30,6 +31,7 @@ public sealed class SessionCoordinator
     private readonly object _sync = new();
     private readonly SessionStateMachine _stateMachine = new();
     private readonly Dictionary<Guid, IncomingText> _receivedTexts = new();
+    private readonly TextHistoryStore? _textHistory;
     private SessionConnection? _active;
     private string? _peerName;
     private string _detail = $"BOB server is ready on port {BobProtocol.DefaultPort}.";
@@ -40,6 +42,26 @@ public sealed class SessionCoordinator
     public event EventHandler<IncomingText>? TextReceived;
 
     public event EventHandler<Guid>? TextAcknowledged;
+
+    public SessionCoordinator()
+    {
+    }
+
+    public SessionCoordinator(TextHistoryStore textHistory)
+    {
+        ArgumentNullException.ThrowIfNull(textHistory);
+        _textHistory = textHistory;
+        foreach (var record in textHistory.ReadAll().Where(record => !record.Outgoing))
+        {
+            _receivedTexts.TryAdd(
+                record.TextId,
+                new IncomingText(
+                    record.TextId,
+                    record.Text,
+                    record.CreatedAt,
+                    record.PeerName));
+        }
+    }
 
     public ConnectionSnapshot Snapshot
     {
@@ -175,6 +197,30 @@ public sealed class SessionCoordinator
             }
 
             incoming = new IncomingText(textId, text, createdAt, peerName);
+            if (_textHistory is not null)
+            {
+                try
+                {
+                    var saved = _textHistory.Save(new TextHistoryRecord(
+                        textId,
+                        text,
+                        createdAt,
+                        DateTimeOffset.UtcNow,
+                        Outgoing: false,
+                        Status: "Received",
+                        PeerName: peerName));
+                    if (!saved.IsNew)
+                    {
+                        _receivedTexts.TryAdd(textId, incoming);
+                        return IncomingTextRegistration.Duplicate;
+                    }
+                }
+                catch (TextHistoryConflictException)
+                {
+                    return IncomingTextRegistration.Conflict;
+                }
+            }
+
             _receivedTexts.Add(textId, incoming);
         }
 

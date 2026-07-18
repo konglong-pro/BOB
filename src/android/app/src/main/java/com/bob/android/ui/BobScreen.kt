@@ -1,9 +1,13 @@
 package com.bob.android.ui
 
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.graphics.Bitmap
 import android.net.Uri
 import android.os.CancellationSignal
 import android.util.Size
+import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
@@ -56,13 +60,11 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
-import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
@@ -214,7 +216,7 @@ private fun BobScreen(
         item {
             Spacer(Modifier.height(30.dp))
             Text(
-                text = "Recent messages",
+                text = "Recent messages · latest 20",
                 color = BobInk,
                 fontSize = 20.sp,
                 fontWeight = FontWeight.Bold,
@@ -563,10 +565,9 @@ private fun EmptyTimeline(connected: Boolean) {
     }
 }
 
-@Suppress("DEPRECATION")
 @Composable
 private fun TimelineCard(item: TextTimelineItemUi) {
-    val clipboard = LocalClipboardManager.current
+    val context = LocalContext.current
     var previewOverflows by remember(item.key) { mutableStateOf(false) }
     var showFullText by remember(item.key) { mutableStateOf(false) }
     Column(
@@ -610,7 +611,7 @@ private fun TimelineCard(item: TextTimelineItemUi) {
         Spacer(Modifier.height(10.dp))
         BobButton(
             label = "Copy full text",
-            onClick = { clipboard.setText(AnnotatedString(item.text)) },
+            onClick = { copyTextToClipboard(context, item.text) },
         )
     }
     if (showFullText) {
@@ -623,8 +624,10 @@ private fun TimelineCard(item: TextTimelineItemUi) {
 
 @Composable
 private fun TransferCard(item: TransferTimelineItemUi) {
+    val context = LocalContext.current
+    val previewUri = item.previewUri
     var showFullImage by rememberSaveable(item.key, item.previewUri) { mutableStateOf(false) }
-    val thumbnail = item.previewUri?.let { uri ->
+    val thumbnail = previewUri?.let { uri ->
         rememberContentBitmap(uri, THUMBNAIL_MAX_PIXELS)
     }
     Column(
@@ -669,9 +672,26 @@ private fun TransferCard(item: TransferTimelineItemUi) {
                     .border(1.dp, BobBorder, RoundedCornerShape(3.dp)),
             )
             Spacer(Modifier.height(8.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                BobButton(
+                    label = "View image",
+                    onClick = { showFullImage = true },
+                    modifier = Modifier.weight(1f),
+                )
+                BobButton(
+                    label = "Copy image",
+                    onClick = { copyImageToClipboard(context, item.name, previewUri) },
+                    modifier = Modifier.weight(1f),
+                )
+            }
+        } else if (previewUri != null) {
+            Spacer(Modifier.height(8.dp))
             BobButton(
-                label = "View image",
-                onClick = { showFullImage = true },
+                label = "Copy image",
+                onClick = { copyImageToClipboard(context, item.name, previewUri) },
                 fillWidth = true,
             )
         }
@@ -697,6 +717,7 @@ private fun FullImageDialog(
     thumbnail: Bitmap,
     onDismiss: () -> Unit,
 ) {
+    val context = LocalContext.current
     val fullImage = rememberContentBitmap(
         uriValue = previewUri,
         maxDimension = FULL_IMAGE_MAX_PIXELS,
@@ -740,11 +761,21 @@ private fun FullImageDialog(
                     .border(1.dp, BobBorder, RoundedCornerShape(3.dp)),
             )
             Spacer(Modifier.height(12.dp))
-            BobButton(
-                label = "Close",
-                onClick = onDismiss,
-                fillWidth = true,
-            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                BobButton(
+                    label = "Copy image",
+                    onClick = { copyImageToClipboard(context, name, previewUri) },
+                    modifier = Modifier.weight(1f),
+                )
+                BobButton(
+                    label = "Close",
+                    onClick = onDismiss,
+                    modifier = Modifier.weight(1f),
+                )
+            }
         }
     }
 }
@@ -782,10 +813,9 @@ private fun rememberContentBitmap(
     return bitmap
 }
 
-@Suppress("DEPRECATION")
 @Composable
 private fun FullTextDialog(text: String, onDismiss: () -> Unit) {
-    val clipboard = LocalClipboardManager.current
+    val context = LocalContext.current
     val chunks = remember(text) { text.toDisplayChunks() }
     Dialog(onDismissRequest = onDismiss) {
         Column(
@@ -828,7 +858,7 @@ private fun FullTextDialog(text: String, onDismiss: () -> Unit) {
             ) {
                 BobButton(
                     label = "Copy full text",
-                    onClick = { clipboard.setText(AnnotatedString(text)) },
+                    onClick = { copyTextToClipboard(context, text) },
                     modifier = Modifier.weight(1f),
                 )
                 BobButton(
@@ -927,6 +957,34 @@ private fun String.toDisplayChunks(): List<DisplayTextChunk> {
         start = end
     }
     return chunks
+}
+
+private fun copyTextToClipboard(context: Context, text: String) {
+    val copied = runCatching {
+        val clipboard = context.getSystemService(ClipboardManager::class.java)
+        clipboard.setPrimaryClip(ClipData.newPlainText("BOB text", text))
+    }.isSuccess
+    Toast.makeText(
+        context,
+        if (copied) "Text copied" else "Could not copy text",
+        Toast.LENGTH_SHORT,
+    ).show()
+}
+
+private fun copyImageToClipboard(context: Context, name: String, uriValue: String) {
+    val copied = runCatching {
+        val uri = Uri.parse(uriValue)
+        require(uri.scheme == "content") { "Only local content URIs can be copied." }
+        val clipboard = context.getSystemService(ClipboardManager::class.java)
+        clipboard.setPrimaryClip(
+            ClipData.newUri(context.contentResolver, name.ifBlank { "BOB image" }, uri),
+        )
+    }.isSuccess
+    Toast.makeText(
+        context,
+        if (copied) "Image copied" else "Could not copy image",
+        Toast.LENGTH_SHORT,
+    ).show()
 }
 
 private const val DISPLAY_CHUNK_CHARS = 512

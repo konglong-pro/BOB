@@ -3,6 +3,7 @@ using System.Net.WebSockets;
 using System.Text;
 using System.Text.Json;
 using Bob.Windows.Domain;
+using Bob.Windows.Persistence;
 using Bob.Windows.Security;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Logging;
@@ -279,11 +280,26 @@ public sealed class WebSocketSessionHandler
             return;
         }
 
-        var registration = _sessions.RegisterIncomingText(
-            textId,
-            text,
-            createdAt,
-            peerName);
+        IncomingTextRegistration registration;
+        try
+        {
+            registration = _sessions.RegisterIncomingText(
+                textId,
+                text,
+                createdAt,
+                peerName);
+        }
+        catch (TextHistoryStoreException)
+        {
+            await SendErrorAsync(
+                lease,
+                "internal_error",
+                "The received text could not be saved.",
+                retryable: true,
+                envelope.Id,
+                cancellationToken);
+            return;
+        }
         if (registration == IncomingTextRegistration.Conflict)
         {
             await SendErrorAsync(
