@@ -19,6 +19,8 @@ var checks = new (string Name, Action Run)[]
     ("incoming text process idempotency", CheckIncomingTextIdempotency),
     ("session state transitions", CheckSessionStateTransitions),
     ("server certificate profile", CheckCertificateProfile),
+    ("real HTTPS and WSS pin validation uses a temporary test key", () =>
+        RealTransportChecks.CheckPinnedTlsAsync().GetAwaiter().GetResult()),
     ("mDNS service descriptor", CheckMdnsServiceDescriptor),
     ("reserved transfer filenames", CheckReservedTransferFilenames),
     ("receive directory setting persists", CheckReceiveDirectorySettingPersists),
@@ -40,11 +42,54 @@ var checks = new (string Name, Action Run)[]
     ("WebSocket and HTTP complete an upload protocol round-trip", () =>
         RealTransportChecks.CheckWebSocketUploadRoundTripAsync().GetAwaiter().GetResult()),
     ("download is state-gated and completes across WebSocket and HTTP", () =>
-        RealTransportChecks.CheckWebSocketDownloadRoundTripAsync().GetAwaiter().GetResult())
+        RealTransportChecks.CheckWebSocketDownloadRoundTripAsync().GetAwaiter().GetResult()),
+    ("64 MiB known-size PUT and GET stream without buffering the body", () =>
+        RealTransportChecks.CheckLargeStreamingRoundTripAsync().GetAwaiter().GetResult()),
+    ("1 GiB chunked PUT is streamed and verified", () =>
+        RealTransportChecks.CheckGigabyteChunkedUploadAsync().GetAwaiter().GetResult()),
+    ("real source and HTTP length exceed 2 GiB and abort cleans up", () =>
+        RealTransportChecks.CheckInt64DownloadAsync().GetAwaiter().GetResult()),
+    ("early digest waits for the closed flushed body", ReliabilityChecks.CheckEarlyDigest),
+    ("cancel closes open handles and retry creates a new transfer", ReliabilityChecks.CheckCancelAndRetry),
+    ("transfer outbox and verification survive restart", ReliabilityChecks.CheckDurableRecovery),
+    ("digest retention is exactly 24 hours", ReliabilityChecks.CheckDigestRetention),
+    ("failed terminals reject completed and published completion wins cancel", ReliabilityChecks.CheckTerminalConflicts),
+    ("typed-invalid histories and directory failures preserve saved data", ReliabilityChecks.CheckHistoryFailures),
+    ("simultaneous failures acknowledge the peer and keep each terminal immutable", ReliabilityChecks.CheckConcurrentFailures),
+    ("the entire journal is validated before pending-file cleanup", ReliabilityChecks.CheckHistoryValidationBeforeCleanup),
+    ("an unconfirmed cancel request accepts the peer's existing failure", ReliabilityChecks.CheckCancelRequestLosesToExistingFailure),
+    ("simultaneous cancellation uses the content receiver's original timestamp", ReliabilityChecks.CheckConcurrentCancellation),
+    ("local cancel in either direction waits for the canonical terminal and holds FIFO", ReliabilityChecks.CheckCancellationOrdering),
+    ("local cancel timeout and restart preserve the request without a failed terminal", ReliabilityChecks.CheckCancellationTimeoutRecovery),
+    ("a lost download digest is replayed while the same session remains online", () =>
+        RealTransportChecks.CheckOnlineDigestReplayAsync().GetAwaiter().GetResult()),
+    ("text-store failures close the session and replay the original IDs after recovery", () =>
+        RealTransportChecks.CheckTextStorageFailureReconnectAsync().GetAwaiter().GetResult()),
+    ("unoffered queued cancellation stays local and peer errors do not echo or change state", () =>
+        RealTransportChecks.CheckQueuedCancellationAndPeerErrorAsync().GetAwaiter().GetResult()),
+    ("offline text outbox is replayed across restart and delivery is durable", () =>
+        RealTransportChecks.CheckTextOutboxRestartAsync().GetAwaiter().GetResult()),
+    ("lost terminal acknowledgement is replayed from snapshot after restart", () =>
+        RealTransportChecks.CheckTerminalReplayAfterRestartAsync().GetAwaiter().GetResult()),
+    ("failed source advances FIFO without waiting for terminalAck", () =>
+        RealTransportChecks.CheckSourceFailureAdvancesQueueAsync().GetAwaiter().GetResult()),
+    ("unaccepted offers survive repeated reconnects with the same ID", () =>
+        RealTransportChecks.CheckRepeatedReconnectQueueAsync().GetAwaiter().GetResult()),
+    ("session snapshot pagination stays within 768 KiB", () =>
+        RealTransportChecks.CheckSnapshotPaginationAsync().GetAwaiter().GetResult()),
+    ("local cancellation accepts the peer timestamp and replays consistently", () =>
+        RealTransportChecks.CheckLocalCancellationRoundTripAsync().GetAwaiter().GetResult())
 };
 
+var selectedChecks = checks.AsEnumerable();
+if (args.Length == 2 && args[0] == "--filter")
+{
+    selectedChecks = selectedChecks.Where(check => check.Name.Contains(args[1], StringComparison.OrdinalIgnoreCase));
+    if (!selectedChecks.Any()) { throw new ArgumentException("No checks matched the requested filter."); }
+}
+else if (args.Length != 0) { throw new ArgumentException("Usage: Bob.Windows.Checks [--filter name]"); }
 var failures = 0;
-foreach (var check in checks)
+foreach (var check in selectedChecks)
 {
     try
     {
@@ -165,7 +210,8 @@ static void CheckCertificateProfile()
     using var certificate = ServerCertificateFactory.Create(
         Guid.Parse("2d8f0aa9-1cd5-4f64-a81e-169eedb115cb"),
         "DESKTOP-BOB",
-        DateTimeOffset.UtcNow);
+        DateTimeOffset.UtcNow,
+        X509KeyStorageFlags.EphemeralKeySet);
 
     Assert(certificate.HasPrivateKey, "certificate must carry a private key.");
 
@@ -440,9 +486,12 @@ static void CheckTextHistoryPersistence()
             "saved incoming history did not restore text ID deduplication.");
 
         File.WriteAllText(Path.Combine(appRoot, "text-messages-v1.json"), "{not valid json");
-        Assert(
-            new TextHistoryStore(paths).ReadAll().Count == 0,
-            "corrupt text history did not recover to an empty timeline.");
+        var corruptRejected = false;
+        try { _ = new TextHistoryStore(paths); }
+        catch (TextHistoryStoreException) { corruptRejected = true; }
+        Assert(corruptRejected, "corrupt history must stop writes instead of losing pending messages.");
+        Assert(File.ReadAllText(Path.Combine(appRoot, "text-messages-v1.json")) == "{not valid json",
+            "corrupt history was overwritten instead of preserved.");
     }
     finally
     {

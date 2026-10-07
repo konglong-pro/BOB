@@ -228,6 +228,22 @@ object BobProtocol {
             .put("retryable", retryable),
     )
 
+    fun transferCancel(transferId: UUID, reason: String = "user"): BobEnvelope = envelope(
+        type = "transfer.cancel",
+        id = UUID.randomUUID(),
+        sentAt = Instant.now(),
+        payload = JSONObject().put("transferId", transferId.toString()).put("reason", reason),
+    )
+
+    fun transferCanceled(transferId: UUID, canceledAt: Instant = Instant.now()): BobEnvelope = envelope(
+        type = "transfer.canceled",
+        id = UUID.randomUUID(),
+        sentAt = Instant.now(),
+        payload = JSONObject()
+            .put("transferId", transferId.toString())
+            .put("canceledAt", canceledAt.toString()),
+    )
+
     fun error(
         code: String,
         message: String,
@@ -492,6 +508,22 @@ object BobProtocol {
         )
     }
 
+    fun parseTransferCancel(envelope: BobEnvelope): BobTransferCancel {
+        requireType(envelope, "transfer.cancel")
+        return BobTransferCancel(
+            transferId = requiredUuid(envelope.payload, "transferId"),
+            reason = requiredString(envelope.payload, "reason"),
+        )
+    }
+
+    fun parseTransferCanceled(envelope: BobEnvelope): BobTransferCanceled {
+        requireType(envelope, "transfer.canceled")
+        return BobTransferCanceled(
+            transferId = requiredUuid(envelope.payload, "transferId"),
+            canceledAt = requiredUtcInstant(envelope.payload, "canceledAt"),
+        )
+    }
+
     fun parseError(envelope: BobEnvelope): BobRemoteError {
         if (envelope.version != VERSION || envelope.type != "error") throw invalid("Expected error v1")
         val payload = envelope.payload
@@ -644,7 +676,7 @@ data class BobSnapshotPage(
     val snapshotId: UUID,
     val page: Int,
     val isLast: Boolean,
-    /** Raw JSON objects reserved for the later transfer slice. */
+    /** Transfer records are applied only after the complete, contiguous snapshot. */
     val transfersJson: List<String>,
 )
 
@@ -734,6 +766,10 @@ data class BobTransferFailed(
     val message: String,
     val retryable: Boolean,
 )
+
+data class BobTransferCancel(val transferId: UUID, val reason: String)
+
+data class BobTransferCanceled(val transferId: UUID, val canceledAt: Instant)
 
 data class BobTransferProgress(
     val transferId: UUID,

@@ -3,6 +3,7 @@ using System.Threading;
 using System.Windows;
 using Bob.Windows.Discovery;
 using Bob.Windows.Persistence;
+using Bob.Windows.Platform;
 using Bob.Windows.Security;
 using Bob.Windows.Storage;
 using Bob.Windows.Transport;
@@ -20,6 +21,7 @@ public partial class App : Application
     private WebApplication? _host;
     private ServerIdentity? _identity;
     private Mutex? _singleInstanceMutex;
+    private TrayController? _tray;
 
     protected override async void OnStartup(StartupEventArgs e)
     {
@@ -59,6 +61,9 @@ public partial class App : Application
 
             builder.WebHost.ConfigureKestrel(options =>
             {
+                options.Limits.MaxRequestBodySize = null;
+                options.Limits.MinRequestBodyDataRate = null;
+                options.Limits.MinResponseDataRate = null;
                 options.ListenAnyIP(BobProtocol.DefaultPort, listen =>
                 {
                     listen.Protocols = HttpProtocols.Http1AndHttp2;
@@ -77,6 +82,7 @@ public partial class App : Application
             builder.Services.AddSingleton<SessionCoordinator>();
             builder.Services.AddSingleton<ReceiveDirectorySettings>();
             builder.Services.AddSingleton<TransferCoordinator>();
+            builder.Services.AddHostedService<TransferMaintenanceService>();
             builder.Services.AddSingleton<WebSocketSessionHandler>();
             builder.Services.AddSingleton<MainWindowViewModel>();
             builder.Services.AddSingleton<MainWindow>();
@@ -85,7 +91,22 @@ public partial class App : Application
             BobEndpoints.Map(_host);
 
             await _host.StartAsync();
-            _host.Services.GetRequiredService<MainWindow>().Show();
+            var window = _host.Services.GetRequiredService<MainWindow>();
+            _tray = new TrayController(
+                window,
+                _host.Services.GetRequiredService<MainWindowViewModel>(),
+                () => Shutdown(0));
+            window.Show();
+        }
+        catch (Exception exception) when (exception is TextHistoryStoreException or TransferHistoryStoreException)
+        {
+            MessageBox.Show(
+                "BOB could not read its saved history. The original data was kept.\n\n"
+                + "Restore a backup and restart BOB.",
+                "BOB history unavailable",
+                MessageBoxButton.OK,
+                MessageBoxImage.Error);
+            Shutdown(1);
         }
         catch (Exception)
         {
@@ -103,6 +124,7 @@ public partial class App : Application
     {
         try
         {
+            _tray?.Dispose();
             if (_host is not null)
             {
                 var host = _host;

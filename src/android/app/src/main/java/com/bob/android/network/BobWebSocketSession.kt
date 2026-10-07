@@ -63,6 +63,10 @@ class BobWebSocketSession(
 
         fun onTransferProgress(progress: BobTransferProgress) {}
 
+        fun onTransferCancel(cancel: BobTransferCancel) {}
+
+        fun onTransferCanceled(canceled: BobTransferCanceled) {}
+
         fun onRemoteError(error: BobRemoteError) {}
 
         fun onDisconnected(closure: BobSessionClosure) {}
@@ -90,6 +94,8 @@ class BobWebSocketSession(
     private var snapshotId: UUID? = null
     private var nextSnapshotPage = 0
     private var helloTimeout: ScheduledFuture<*>? = null
+    private var snapshotTimeout: ScheduledFuture<*>? = null
+    private var snapshotProgressGeneration = 0L
     private var forcedClose: ScheduledFuture<*>? = null
     private var localCloseCode: Int? = null
     private var localCloseReason: String? = null
@@ -201,10 +207,11 @@ class BobWebSocketSession(
         size: Long?,
         mediaType: String,
         createdAt: Instant,
+        retryOf: UUID? = null,
     ): UUID? = sendEnvelope(
         BobProtocol.transferOffer(
             transferId = transferId,
-            retryOf = null,
+            retryOf = retryOf,
             kind = kind,
             name = name,
             size = size,
@@ -227,8 +234,9 @@ class BobWebSocketSession(
         bytes: Long,
         sha256: String,
         storedName: String,
+        completedAt: Instant = Instant.now(),
     ): UUID? = sendEnvelope(
-        BobProtocol.transferCompleted(transferId, bytes, sha256, storedName),
+        BobProtocol.transferCompleted(transferId, bytes, sha256, storedName, completedAt),
     )
 
     fun acknowledgeTransferTerminal(
@@ -242,6 +250,11 @@ class BobWebSocketSession(
         message: String,
         retryable: Boolean = true,
     ): UUID? = sendEnvelope(BobProtocol.transferFailed(transferId, code, message, retryable))
+
+    fun cancelTransfer(transferId: UUID): UUID? = sendEnvelope(BobProtocol.transferCancel(transferId))
+
+    fun sendTransferCanceled(transferId: UUID, canceledAt: Instant): UUID? =
+        sendEnvelope(BobProtocol.transferCanceled(transferId, canceledAt))
 
     private fun sendEnvelope(envelope: BobEnvelope): UUID? =
         if (sendConnected(envelope)) envelope.id else null
@@ -527,6 +540,16 @@ class BobWebSocketSession(
                         dispatch(listenerGeneration) { listener.onTransferProgress(progress) }
                     }
 
+                    "transfer.cancel" -> {
+                        val cancel = BobProtocol.parseTransferCancel(envelope)
+                        dispatch(listenerGeneration) { listener.onTransferCancel(cancel) }
+                    }
+
+                    "transfer.canceled" -> {
+                        val canceled = BobProtocol.parseTransferCanceled(envelope)
+                        dispatch(listenerGeneration) { listener.onTransferCanceled(canceled) }
+                    }
+
                     "error" -> handleRemoteError(listenerGeneration, webSocket, envelope)
                     else -> sendError(
                         listenerGeneration,
@@ -582,6 +605,7 @@ class BobWebSocketSession(
                 welcome = parsed,
             )
             receivingState = currentState
+            armSnapshotTimeoutLocked(listenerGeneration, webSocket)
         }
         publishState(receivingState)
         dispatch(listenerGeneration) { listener.onWelcome(parsed) }
@@ -629,6 +653,12 @@ class BobWebSocketSession(
                 )
             }
             nextSnapshotPage = parsed.page + 1
+            if (parsed.isLast) {
+                snapshotTimeout?.cancel(false)
+                snapshotTimeout = null
+            } else {
+                armSnapshotTimeoutLocked(listenerGeneration, webSocket)
+            }
             if (parsed.isLast) {
                 acceptedWelcome = welcome ?: throw BobProtocolException(
                     BobProtocol.ERROR_INVALID_MESSAGE,
@@ -770,6 +800,21 @@ class BobWebSocketSession(
             "welcome_timeout",
             locallyRequested = true,
         )
+    }
+
+    private fun armSnapshotTimeoutLocked(listenerGeneration: Long, webSocket: WebSocket) {
+        snapshotTimeout?.cancel(false)
+        snapshotProgressGeneration += 1
+        val progressGeneration = snapshotProgressGeneration
+        snapshotTimeout = scheduler.schedule({
+            val expired = synchronized(lock) {
+                isCurrentCallbackLocked(listenerGeneration, webSocket) &&
+                    currentState.phase == BobSessionPhase.ReceivingSnapshot &&
+                    snapshotProgressGeneration == progressGeneration
+            }
+            if (expired) finishFailure(listenerGeneration, webSocket,
+                IOException("WSS snapshot made no progress for 60 seconds."), null)
+        }, 60L, TimeUnit.SECONDS)
     }
 
     private fun beginClose(
@@ -982,6 +1027,9 @@ class BobWebSocketSession(
     private fun cancelTimersLocked() {
         helloTimeout?.cancel(false)
         helloTimeout = null
+        snapshotTimeout?.cancel(false)
+        snapshotTimeout = null
+        snapshotProgressGeneration += 1
         forcedClose?.cancel(false)
         forcedClose = null
     }

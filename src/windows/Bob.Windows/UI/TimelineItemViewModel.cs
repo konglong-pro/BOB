@@ -1,4 +1,5 @@
 using System.ComponentModel;
+using System.Globalization;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Windows;
@@ -6,6 +7,7 @@ using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using Bob.Windows.Domain;
+using System.Diagnostics;
 
 namespace Bob.Windows.UI;
 
@@ -21,9 +23,24 @@ public sealed class TimelineItemViewModel : INotifyPropertyChanged
     private readonly RelayCommand _viewImageCommand;
     private readonly RelayCommand _copyTextCommand;
     private readonly RelayCommand _copyImageCommand;
+    private readonly RelayCommand _expandTextCommand;
+    private readonly string _textPreview;
+    private bool _fullTextShown;
     private string? _localPath;
     private ImageSource? _thumbnail;
     private long _thumbnailRevision;
+    private readonly Action<string>? _openFile;
+    private readonly AsyncRelayCommand _cancelCommand;
+    private readonly AsyncRelayCommand _retryCommand;
+    private readonly RelayCommand _openFileCommand;
+    private TransferState? _transferState;
+    private bool _retryable;
+    private bool _cancelPending;
+    private long _bytesTransferred;
+    private long? _totalBytes;
+    private long _lastSampleTime;
+    private long _lastSampleBytes;
+    private double _bytesPerSecond;
 
     public TimelineItemViewModel(
         Guid textId,
@@ -37,11 +54,17 @@ public sealed class TimelineItemViewModel : INotifyPropertyChanged
         string? localPath = null,
         Action<string>? openImage = null,
         Action<string>? copyText = null,
-        Action<string>? copyImage = null)
+        Action<string>? copyImage = null,
+        Func<Guid, Task>? cancel = null,
+        Func<Guid, Task>? retry = null,
+        Action<string>? openFile = null,
+        DateTimeOffset? recordedAt = null)
     {
         TextId = textId;
         Text = text;
+        _textPreview = CreateTextPreview(text);
         CreatedAt = createdAt;
+        RecordedAt = recordedAt ?? DateTimeOffset.UtcNow;
         Outgoing = outgoing;
         _status = status;
         _detail = detail;
@@ -49,8 +72,17 @@ public sealed class TimelineItemViewModel : INotifyPropertyChanged
         _openImage = openImage;
         _copyText = copyText;
         _copyImage = copyImage;
+        _openFile = openFile;
+        _cancelCommand = new AsyncRelayCommand(
+            () => cancel?.Invoke(TextId) ?? Task.CompletedTask,
+            () => cancel is not null && CanCancel);
+        _retryCommand = new AsyncRelayCommand(
+            () => retry?.Invoke(TextId) ?? Task.CompletedTask,
+            () => retry is not null && CanRetry);
+        _openFileCommand = new RelayCommand(OpenFile, CanOpenFile);
         _viewImageCommand = new RelayCommand(ViewImage, CanViewImage);
         _copyTextCommand = new RelayCommand(CopyText, CanCopyText);
+        _expandTextCommand = new RelayCommand(ToggleFullText, () => CanExpandText);
         _copyImageCommand = new RelayCommand(CopyImage, CanCopyImage);
         PeerName = peerName;
         LocalPath = localPath;
@@ -62,7 +94,54 @@ public sealed class TimelineItemViewModel : INotifyPropertyChanged
 
     public string Text { get; }
 
+    public string DisplayText => IsText && !_fullTextShown ? _textPreview : Text;
+
+    public string TextExpansionLabel => _fullTextShown ? "Collapse text" : "Read full text";
+
+    public Visibility TextExpansionVisibility => CanExpandText ? Visibility.Visible : Visibility.Collapsed;
+
+    public ICommand ExpandTextCommand => _expandTextCommand;
+
+    private bool CanExpandText => IsText && !ReferenceEquals(_textPreview, Text);
+
+    private void ToggleFullText()
+    {
+        _fullTextShown = !_fullTextShown;
+        OnPropertyChanged(nameof(DisplayText));
+        OnPropertyChanged(nameof(TextExpansionLabel));
+    }
+
+    private static string CreateTextPreview(string text)
+    {
+        var end = Math.Min(text.Length, 1_024);
+        var lineStart = 0;
+        for (var line = 0; line < 8; line++)
+        {
+            var newline = text.IndexOf('\n', lineStart);
+            if (newline < 0 || newline >= end)
+            {
+                break;
+            }
+            lineStart = newline + 1;
+            if (line == 7)
+            {
+                end = lineStart;
+            }
+        }
+        if (end == text.Length)
+        {
+            return text;
+        }
+        if (end > 0 && char.IsHighSurrogate(text[end - 1]))
+        {
+            end--;
+        }
+        return text[..end] + "…";
+    }
+
     public DateTimeOffset CreatedAt { get; }
+
+    public DateTimeOffset RecordedAt { get; }
 
     public bool Outgoing { get; }
 
@@ -71,9 +150,91 @@ public sealed class TimelineItemViewModel : INotifyPropertyChanged
     public HorizontalAlignment Alignment =>
         Outgoing ? HorizontalAlignment.Right : HorizontalAlignment.Left;
 
-    public string DirectionLabel => Outgoing ? "To phone" : $"From {PeerName}";
+    public string DirectionLabel => Outgoing ? "THIS COMPUTER" : $"PHONE · {PeerName}";
 
-    public string TimeLabel => CreatedAt.ToLocalTime().ToString("HH:mm");
+    public string TimeLabel => CreatedAt.ToLocalTime().ToString("MMM d · HH:mm", CultureInfo.InvariantCulture);
+
+    public ICommand CancelCommand => _cancelCommand;
+    public ICommand RetryCommand => _retryCommand;
+    public ICommand OpenFileCommand => _openFileCommand;
+    private bool CanCancel => !_cancelPending && _transferState is TransferState.Queued
+        or TransferState.Offered or TransferState.Accepted
+        or TransferState.Transferring or TransferState.Verifying;
+    private bool CanRetry => Outgoing && !_cancelPending && _retryable
+        && _transferState is TransferState.Failed or TransferState.Canceled;
+    public Visibility CancelVisibility => CanCancel ? Visibility.Visible : Visibility.Collapsed;
+    public Visibility RetryVisibility => CanRetry ? Visibility.Visible : Visibility.Collapsed;
+    public Visibility OpenFileVisibility => CanOpenFile() ? Visibility.Visible : Visibility.Collapsed;
+    public Visibility ProgressVisibility => _transferState is TransferState.Accepted
+        or TransferState.Transferring or TransferState.Verifying
+        ? Visibility.Visible : Visibility.Collapsed;
+    public bool ProgressIndeterminate => _totalBytes is null || _transferState == TransferState.Verifying;
+    public double ProgressValue => _totalBytes is > 0
+        ? Math.Clamp(100d * _bytesTransferred / _totalBytes.Value, 0d, 100d)
+        : _transferState == TransferState.Transferring ? 0d : 100d;
+    public string RateLabel
+    {
+        get
+        {
+            if (_transferState != TransferState.Transferring || _bytesPerSecond <= 0)
+            {
+                return string.Empty;
+            }
+
+            var rate = $"{FormatBytes((long)_bytesPerSecond)}/s";
+            if (_totalBytes is long total && total > _bytesTransferred)
+            {
+                var seconds = (total - _bytesTransferred) / _bytesPerSecond;
+                rate += seconds >= 3600
+                    ? $" · {seconds / 3600:0.#} h left"
+                    : seconds >= 60
+                        ? $" · {seconds / 60:0} min left"
+                        : $" · {Math.Max(1, seconds):0} sec left";
+            }
+
+            return rate;
+        }
+    }
+
+    public Visibility RateVisibility => string.IsNullOrEmpty(RateLabel) ? Visibility.Collapsed : Visibility.Visible;
+
+    public void ApplyTransferProgress(TransferSnapshot snapshot)
+    {
+        var now = Stopwatch.GetTimestamp();
+        if (snapshot.State == TransferState.Transferring && _transferState == TransferState.Transferring
+            && _lastSampleTime != 0
+            && snapshot.BytesTransferred > _lastSampleBytes)
+        {
+            var seconds = Stopwatch.GetElapsedTime(_lastSampleTime, now).TotalSeconds;
+            if (seconds > 0.1)
+            {
+                var sample = (snapshot.BytesTransferred - _lastSampleBytes) / seconds;
+                _bytesPerSecond = _bytesPerSecond == 0 ? sample : 0.7 * _bytesPerSecond + 0.3 * sample;
+                _lastSampleTime = now;
+                _lastSampleBytes = snapshot.BytesTransferred;
+            }
+        }
+        else if (_lastSampleTime == 0 || _transferState != TransferState.Transferring)
+        {
+            _lastSampleTime = now;
+            _lastSampleBytes = snapshot.BytesTransferred;
+        }
+
+        _transferState = snapshot.State;
+        _cancelPending = snapshot.CancelPending;
+        _retryable = snapshot.Retryable || snapshot.State == TransferState.Canceled && !_cancelPending;
+        _bytesTransferred = snapshot.BytesTransferred;
+        _totalBytes = snapshot.Size;
+        foreach (var property in new[] { nameof(CancelVisibility), nameof(RetryVisibility),
+            nameof(OpenFileVisibility), nameof(ProgressVisibility), nameof(ProgressIndeterminate),
+            nameof(ProgressValue), nameof(RateLabel), nameof(RateVisibility), nameof(Status) })
+        {
+            OnPropertyChanged(property);
+        }
+        _cancelCommand.RaiseCanExecuteChanged();
+        _retryCommand.RaiseCanExecuteChanged();
+        _openFileCommand.RaiseCanExecuteChanged();
+    }
 
     public ICommand ViewImageCommand => _viewImageCommand;
 
@@ -87,7 +248,7 @@ public sealed class TimelineItemViewModel : INotifyPropertyChanged
 
     public string Status
     {
-        get => _status;
+        get => _cancelPending ? "Canceling..." : _status;
         set
         {
             if (_status == value)
@@ -141,6 +302,8 @@ public sealed class TimelineItemViewModel : INotifyPropertyChanged
             OnPropertyChanged(nameof(CopyImageVisibility));
             _viewImageCommand.RaiseCanExecuteChanged();
             _copyImageCommand.RaiseCanExecuteChanged();
+            OnPropertyChanged(nameof(OpenFileVisibility));
+            _openFileCommand.RaiseCanExecuteChanged();
         }
     }
 
@@ -189,6 +352,31 @@ public sealed class TimelineItemViewModel : INotifyPropertyChanged
         {
             _copyText!(Text);
         }
+    }
+
+    private bool CanOpenFile() => _kind == TransferKind.File
+        && _transferState == TransferState.Completed && _openFile is not null
+        && !string.IsNullOrWhiteSpace(LocalPath) && File.Exists(LocalPath);
+
+    private void OpenFile()
+    {
+        if (CanOpenFile())
+        {
+            _openFile!(LocalPath!);
+        }
+    }
+
+    private static string FormatBytes(long bytes)
+    {
+        string[] units = ["B", "KiB", "MiB", "GiB", "TiB"];
+        var value = (double)bytes;
+        var unit = 0;
+        while (value >= 1024 && unit < units.Length - 1)
+        {
+            value /= 1024;
+            unit++;
+        }
+        return unit == 0 ? $"{bytes} B" : $"{value:0.##} {units[unit]}";
     }
 
     private bool CanViewImage() =>

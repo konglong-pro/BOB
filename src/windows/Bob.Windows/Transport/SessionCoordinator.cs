@@ -1,4 +1,5 @@
 using System.Net.WebSockets;
+using System.Text;
 using Bob.Windows.Domain;
 using Bob.Windows.Persistence;
 
@@ -32,6 +33,8 @@ public sealed class SessionCoordinator
     private readonly SessionStateMachine _stateMachine = new();
     private readonly Dictionary<Guid, IncomingText> _receivedTexts = new();
     private readonly TextHistoryStore? _textHistory;
+    private readonly Dictionary<Guid, TextHistoryRecord> _pendingTexts = new();
+    private readonly SemaphoreSlim _textDrain = new(1, 1);
     private SessionConnection? _active;
     private string? _peerName;
     private string _detail = $"BOB server is ready on port {BobProtocol.DefaultPort}.";
@@ -60,6 +63,11 @@ public sealed class SessionCoordinator
                     record.Text,
                     record.CreatedAt,
                     record.PeerName));
+        }
+        foreach (var record in textHistory.ReadAll().Where(record =>
+            record.Outgoing && record.Status != "Delivered"))
+        {
+            _pendingTexts.Add(record.TextId, record);
         }
     }
 
@@ -104,15 +112,28 @@ public sealed class SessionCoordinator
         DateTimeOffset createdAt,
         CancellationToken cancellationToken = default)
     {
-        var envelope = ProtocolJson.Create(
-            "text.send",
-            new
+        if (textId == Guid.Empty || string.IsNullOrWhiteSpace(text)
+            || Encoding.UTF8.GetByteCount(text) > BobProtocol.MaxTextBytes
+            || createdAt == default || createdAt.Offset != TimeSpan.Zero)
+        {
+            throw new ArgumentException("Text must have a valid ID, UTC timestamp and at most 256 KiB of UTF-8.");
+        }
+
+        lock (_sync)
+        {
+            var record = new TextHistoryRecord(textId, text, createdAt, DateTimeOffset.UtcNow,
+                Outgoing: true, Status: "Queued", PeerName: _peerName ?? "phone");
+            record = _textHistory?.Save(record).Record ?? record;
+            if (record.Status == "Delivered") { return; }
+            if (_pendingTexts.TryGetValue(textId, out var previous)
+                && (previous.Text != text || previous.CreatedAt != createdAt))
             {
-                textId,
-                text,
-                createdAt
-            });
-        await SendEnvelopeAsync(envelope, cancellationToken);
+                throw new TextHistoryConflictException(textId);
+            }
+            _pendingTexts[textId] = record;
+        }
+
+        await DrainPendingTextsAsync(cancellationToken).ConfigureAwait(false);
     }
 
     public async Task SendEnvelopeAsync(
@@ -138,6 +159,7 @@ public sealed class SessionCoordinator
         TransferCoordinator transfers,
         CancellationToken cancellationToken = default)
     {
+        if (!Snapshot.IsConnected) { return false; }
         var offer = transfers.TryOfferNextOutgoing();
         if (offer is null)
         {
@@ -153,13 +175,100 @@ public sealed class SessionCoordinator
         }
         catch
         {
-            transfers.FailLocal(
-                offer.TransferId,
-                "network_interrupted",
-                "The transfer offer could not be sent.",
-                retryable: true);
+            transfers.ReturnOutgoingOfferToQueue(offer.TransferId);
             throw;
         }
+    }
+
+    public async Task CancelTransferAsync(TransferCoordinator transfers, Guid transferId,
+        CancellationToken cancellationToken = default)
+    {
+        var state = transfers.Cancel(transferId);
+        if (state != TransferState.Canceled) { return; }
+        if (!Snapshot.IsConnected) { transfers.SuspendPendingCancellation(transferId); return; }
+        try
+        {
+            var request = transfers.ReadTerminalOrCancelEnvelope(transferId);
+            if (request?.Type == "transfer.cancel")
+            {
+                await SendEnvelopeAsync(request, cancellationToken);
+            }
+            await SendNextTransferOfferAsync(transfers, cancellationToken);
+        }
+        catch (Exception exception) when (exception is InvalidOperationException or IOException
+            or WebSocketException or OperationCanceledException)
+        {
+            transfers.SuspendPendingCancellation(transferId);
+            AbortActiveConnection();
+            // The persisted cancellation is replayed in the next verified session.
+        }
+    }
+
+    internal Task ReplayPendingTextsAsync(CancellationToken cancellationToken) =>
+        DrainPendingTextsAsync(cancellationToken);
+
+    internal void AbortActiveConnection()
+    {
+        lock (_sync) { _active?.Socket.Abort(); }
+    }
+
+    private async Task DrainPendingTextsAsync(CancellationToken cancellationToken)
+    {
+        await _textDrain.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            SessionConnection connection;
+            TextHistoryRecord[] pending;
+            lock (_sync)
+            {
+                if (_stateMachine.Phase != SessionPhase.Connected || _active is null) { return; }
+                connection = _active;
+                pending = _pendingTexts.Values.OrderBy(record => record.RecordedAt).ToArray();
+            }
+            foreach (var record in pending)
+            {
+                lock (_sync)
+                {
+                    if (!ReferenceEquals(_active, connection)) { return; }
+                    if (!_pendingTexts.ContainsKey(record.TextId)
+                        || connection.SentTexts.Contains(record.TextId)) { continue; }
+                }
+                try
+                {
+                    await connection.SendAsync(ProtocolJson.Create("text.send", new
+                    {
+                        textId = record.TextId,
+                        text = record.Text,
+                        createdAt = record.CreatedAt
+                    }), cancellationToken).ConfigureAwait(false);
+                }
+                catch (Exception exception) when (exception is IOException or WebSocketException
+                    or OperationCanceledException)
+                {
+                    // The body and ID were already saved, so reconnect can safely replay them.
+                    return;
+                }
+                try
+                {
+                    lock (_sync)
+                    {
+                        connection.SentTexts.Add(record.TextId);
+                        if (_pendingTexts.ContainsKey(record.TextId))
+                        {
+                            _textHistory?.UpdateStatus(record.TextId, "Awaiting confirmation");
+                        }
+                    }
+                }
+                catch (TextHistoryStoreException)
+                {
+                    // This ID was sent but its delivery state could not be saved.
+                    // Reset the per-session sent set via reconnect before replaying.
+                    connection.Socket.Abort();
+                    throw;
+                }
+            }
+        }
+        finally { _textDrain.Release(); }
     }
 
     internal void CompleteHandshake(SessionLease lease, string peerName)
@@ -228,8 +337,17 @@ public sealed class SessionCoordinator
         return IncomingTextRegistration.Added;
     }
 
-    internal void PublishTextAcknowledged(Guid textId) =>
+    internal void PublishTextAcknowledged(Guid textId)
+    {
+        lock (_sync)
+        {
+            if (!_pendingTexts.ContainsKey(textId)) { return; }
+            // A UI subscriber is optional. Delivery must be durable before notifying it.
+            _textHistory?.UpdateStatus(textId, "Delivered");
+            _pendingTexts.Remove(textId);
+        }
         TextAcknowledged?.Invoke(this, textId);
+    }
 
     internal void Release(SessionLease lease)
     {
@@ -280,23 +398,39 @@ public sealed class SessionCoordinator
 
         public WebSocket Socket { get; }
 
+        public HashSet<Guid> SentTexts { get; } = new();
+
         public async Task SendAsync(
             ProtocolEnvelope envelope,
             CancellationToken cancellationToken)
         {
             var bytes = ProtocolJson.Serialize(envelope);
-            await _sendLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+            if (bytes.Length > BobProtocol.MaxEnvelopeBytes)
+            {
+                throw new InvalidOperationException("The outgoing envelope exceeds 1 MiB.");
+            }
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeout.CancelAfter(TimeSpan.FromSeconds(10));
+            var lockTaken = false;
             try
             {
+                await _sendLock.WaitAsync(timeout.Token).ConfigureAwait(false);
+                lockTaken = true;
                 await Socket.SendAsync(
                     bytes.AsMemory(),
                     WebSocketMessageType.Text,
                     endOfMessage: true,
-                    cancellationToken).ConfigureAwait(false);
+                    timeout.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+            {
+                Socket.Abort();
+                throw new WebSocketException(WebSocketError.ConnectionClosedPrematurely,
+                    "The WebSocket send timed out.");
             }
             finally
             {
-                _sendLock.Release();
+                if (lockTaken) { _sendLock.Release(); }
             }
         }
 

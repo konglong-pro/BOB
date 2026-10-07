@@ -6,6 +6,7 @@ import java.io.File
 import java.io.FileNotFoundException
 import java.io.FileOutputStream
 import java.io.InputStreamReader
+import java.nio.file.Files
 import java.time.Clock
 import java.time.Instant
 import java.util.Collections
@@ -286,8 +287,10 @@ class AtomicTextMessageStore private constructor(
             storage.openRead().use { input ->
                 InputStreamReader(input, Charsets.UTF_8).use(InputStreamReader::readText)
             }
-        } catch (_: FileNotFoundException) {
-            return emptyList()
+        } catch (failure: FileNotFoundException) {
+            if (listOf(storage.baseFile, File(storage.baseFile.path + ".bak"), File(storage.baseFile.path + ".new"))
+                    .all { Files.notExists(it.toPath()) }) return emptyList()
+            throw TextStoreException("Unable to read the text store. The original data was kept.", failure)
         } catch (failure: Exception) {
             throw TextStoreException("Unable to read the text store.", failure)
         }

@@ -11,7 +11,6 @@ import com.bob.android.security.BobServerInfoException
 import com.bob.android.security.BobTrustRecord
 import com.bob.android.security.BobTrustStore
 import java.io.ByteArrayOutputStream
-import java.io.Closeable
 import java.net.Proxy
 import java.nio.ByteBuffer
 import java.nio.charset.CodingErrorAction
@@ -22,6 +21,7 @@ import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.TimeUnit
 import javax.net.ssl.SSLContext
 import javax.net.ssl.X509TrustManager
+import kotlin.coroutines.EmptyCoroutineContext
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.currentCoroutineContext
@@ -44,8 +44,8 @@ class BobHttpsConnection internal constructor(
     val serverInfo: BobServerInfo,
     val trustRecord: BobTrustRecord,
     val client: OkHttpClient,
-) : Closeable {
-    override fun close() {
+) {
+    suspend fun close() = withContext(Dispatchers.IO + NonCancellable) {
         client.shutdown()
     }
 }
@@ -341,7 +341,8 @@ class BobHttpsConnector(
 }
 
 private suspend fun Call.awaitResponse(): Response = suspendCancellableCoroutine { continuation ->
-    continuation.invokeOnCancellation { cancel() }
+    // Cancellation itself may close a Conscrypt socket and must also leave Main.
+    continuation.invokeOnCancellation { Dispatchers.IO.dispatch(EmptyCoroutineContext) { cancel() } }
     enqueue(
         object : Callback {
             override fun onFailure(call: Call, e: java.io.IOException) {
@@ -350,7 +351,9 @@ private suspend fun Call.awaitResponse(): Response = suspendCancellableCoroutine
 
             override fun onResponse(call: Call, response: Response) {
                 continuation.resume(response) { _, unconsumedResponse, _ ->
-                    unconsumedResponse.close()
+                    // Prompt cancellation may invoke this callback on the cancelling
+                    // UI thread, even though OkHttp delivered the response on its worker.
+                    Dispatchers.IO.dispatch(EmptyCoroutineContext) { unconsumedResponse.close() }
                 }
             }
         },
@@ -358,8 +361,22 @@ private suspend fun Call.awaitResponse(): Response = suspendCancellableCoroutine
 }
 
 private fun OkHttpClient.shutdown() {
-    dispatcher.cancelAll()
-    connectionPool.evictAll()
-    dispatcher.executorService.shutdown()
-    cache?.close()
+    var failure: Throwable? = null
+    // Attempt every release, retaining the first error and all later failures.
+    // A failed socket close must not skip executor/cache cleanup or hide a leak.
+    val releases = listOf<() -> Unit>(
+        { dispatcher.cancelAll() },
+        { connectionPool.evictAll() },
+        { dispatcher.executorService.shutdown() },
+        { cache?.close() },
+    )
+    for (release in releases) {
+        try {
+            release()
+        } catch (error: Throwable) {
+            val first = failure
+            if (first == null) failure = error else if (first !== error) first.addSuppressed(error)
+        }
+    }
+    failure?.let { throw it }
 }

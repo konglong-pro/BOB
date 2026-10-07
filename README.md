@@ -4,11 +4,13 @@ BOB 是一个自用的 Android 14 与 Windows 10/11 局域网双向传输工具�
 
 ## 当前状态
 
-连接、文字与前台在线文件切片已经落地：
+双端聊天界面、连接和流式文件传输已经落地，保留原有紫色配色：
 
-- Windows：全英文 WPF GUI、共享像素风图标、HTTPS/WSS 服务、原生 DNS-SD、原子持久文字历史（界面恢复最近 20 条），以及图片/文件多选、流式 PUT/GET、SHA-256、`.part`、禁止覆盖发布、文字/图片复制、图片预览和可持久配置的收件目录。
-- Android：全英文 Compose GUI、共享像素风图标、多地址局域网发现、手动 IP、受限 TOFU、严格完整证书 pin、持久文字（界面展示最近 20 条），以及图片/文件多选、流式 PUT/GET、pending MediaStore 发布、文字/原图复制和图片预览；连接失败会显示候选地址和安全分类后的网络/TLS/WSS 原因。
-- 当前文件传输只承诺双方在线且 Android 位于前台；离线/重启恢复、锁屏前台服务、取消/重试、系统分享入口与 Windows 拖放尚未实现。Android 14 真机连接与本切片的最近 20 条文字/复制入口已验收；双向图片正文、系统剪贴板粘贴兼容性和 MediaStore 落地仍需继续实测。
+- Windows：接收在左、发送在右的文字/图片/文件会话，拖放与多选，离线文字和文件排队、原子日志恢复、取消与新 ID 从头重试、进度与速度/ETA。关闭窗口隐藏到托盘，托盘的 Exit BOB 才停止服务。收件目录可配置，已验证内容禁止覆盖发布。
+- Android：同一聊天布局、多地址 NSD、手动 IP、受限 TOFU 与严格证书 pin、自动重连和文字幂等重放。成功的手动目标跨重启使用原 pin 恢复，主动 Disconnect 保留暂停连接的意愿；原生编辑状态避免快速输入丢字。活动传输使用原生前台服务和有界资源锁；接收先写 pending MediaStore，校验后发布，支持取消与重新选择/从头重试。
+- 大文件取消了 Windows 默认约 30 MB 的正文限制，双端使用有界缓冲和 64 位计数，不设文件大小或整体传输时长限制。正文停滞 60 秒会关闭和清理；写完正文后的摘要协调保留 24 小时，重连沿用原 ID。
+- Android 14 真机已完成真实 Wi-Fi 双向 2 GiB + 17 字节、完整 SHA-256、已有传输锁屏继续，以及 MediaStore 与日志恢复检查，具体版本和最终复测范围见设备验收记录。
+- Android 临时 URI 在进程退出后不保证可读；传输中的正文重启后标记失败，需要重选或从头重试。Android 15+ 的后台 dataSync 受系统累计时限约束。系统分享入口、通知完善、清空历史与正式发布验收仍待完成；拔线深度 Doze 和其他 Android 版本尚未验收。
 
 ## 本地工具
 
@@ -19,11 +21,11 @@ BOB 是一个自用的 Android 14 与 Windows 10/11 局域网双向传输工具�
 在仓库根目录运行：
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup-toolchain.ps1 -ToolsRoot .\.tools
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\build.ps1
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\check.ps1
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-windows.ps1
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\publish-windows-launcher.ps1
+pwsh.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup-toolchain.ps1 -ToolsRoot .\.tools
+pwsh.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\build.ps1
+pwsh.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\check.ps1
+pwsh.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-windows.ps1
+pwsh.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\publish-windows-launcher.ps1
 ```
 
 首次命令会下载项目内便携工具链并要求接受 Android SDK 许可；已经存在时会复用缓存。
@@ -32,7 +34,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\publish-window
 
 `publish-windows-launcher.ps1` 会构建 Windows Release 版本，并在仓库根目录生成可直接双击的 `BOB.exe`。快捷启动器没有控制台窗口，使用仓库自带的 `.tools/dotnet`，因此需要和完整的 BOB 仓库目录一起保留。普通 `build.ps1` 默认只更新 Debug；准备通过根目录 `BOB.exe` 联调时必须重新运行发布脚本，避免启动旧 Release。
 
-只有 Android 显示 `Connected` 且 Windows 右上角显示 `Phone connected · <手机名>`，才表示 HTTPS、证书 pin、WSS hello/welcome 和最终 snapshot 已全部完成。Windows 等待、握手和断开原因会保留在同一状态框中。
+只有 Android 和 Windows 会话头均显示 `Connected`，才表示 HTTPS、证书 pin、WSS hello/welcome 和最终 snapshot 已全部完成。发现、手动 IP、等待、握手和断开原因位于 Connection 面板。
 
 Android 调试 APK 构建在 `src/android/app/build/outputs/apk/debug/app-debug.apk`。连接 Android 14 手机并开启 USB 调试后，可用项目内的 `adb` 安装：
 
@@ -40,9 +42,13 @@ Android 调试 APK 构建在 `src/android/app/build/outputs/apk/debug/app-debug.
 .\.tools\android-sdk\platform-tools\adb.exe install -r .\src\android\app\build\outputs\apk\debug\app-debug.apk
 ```
 
+本轮已连接手机的升级包为 [同签名 APK](artifacts/device-qa/app-debug-device.apk)，已覆盖安装并保留原数据与证书 pin。切换构建账户可能改变默认 Debug 签名，覆盖升级需保持原签名；具体产物摘要和检查记录见 [真机验收记录](docs/active/device-validation-2026-10-07.md)。
+
 ## 文档入口
 
 - [当前阶段](docs/active/current.md)
+- [本轮优化与验证记录](docs/active/optimization-2026-10-06.md)
+- [Android 真机验收与优化补充](docs/active/device-validation-2026-10-07.md)
 - [阶段清单](docs/phase-manifest.yaml)
 - [BOB v1 主规格](docs/planning/active/bob-v1-spec.md)
 - [传输协议](docs/contracts/transport-v1.md)

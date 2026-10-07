@@ -38,7 +38,8 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged
     private string _connectionText = "Waiting for phone";
     private string _connectionDetail = $"BOB server is ready on port {BobProtocol.DefaultPort}.";
     private Brush _connectionBrush = WaitingBrush;
-    private string _composerHint = "Connect a phone to send text";
+    private string _composerHint = "Offline · messages and files will wait for your phone";
+    private string _conversationTitle = "Your phone";
     private string _settingsHint = "New received files are saved in this folder.";
     private long _connectionRevision = -1;
 
@@ -70,7 +71,16 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged
         transfers.TransferChanged += OnTransferChanged;
         foreach (var record in textHistory.ReadRecent(VisibleTextHistoryLimit))
         {
-            AddVisibleTextItem(CreateTextItem(record));
+            var item = CreateTextItem(record);
+            AddVisibleTextItem(item);
+            if (record.Outgoing && record.Status != "Delivered")
+            {
+                _outgoing[record.TextId] = item;
+            }
+        }
+        foreach (var snapshot in transfers.ReadAllSnapshots())
+        {
+            ApplyTransferSnapshot(snapshot);
         }
         ApplyConnectionSnapshot(sessions.Snapshot);
     }
@@ -80,6 +90,12 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged
     public ObservableCollection<TimelineItemViewModel> Timeline { get; } = new();
 
     public string ServerDetails { get; }
+
+    public string ConversationTitle
+    {
+        get => _conversationTitle;
+        private set => SetField(ref _conversationTitle, value);
+    }
 
     public ICommand SendTextCommand => _sendTextCommand;
 
@@ -105,6 +121,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged
 
             _draftText = value;
             OnPropertyChanged();
+            OnPropertyChanged(nameof(DraftPlaceholderVisibility));
             _sendTextCommand.RaiseCanExecuteChanged();
 
             if (Encoding.UTF8.GetByteCount(value) > BobProtocol.MaxTextBytes)
@@ -113,7 +130,11 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged
             }
             else if (_sessions.Snapshot.IsConnected)
             {
-                ComposerHint = "Press Enter for a new line; click Send Text to send";
+                ComposerHint = "Ctrl+Enter to send · Enter for a new line";
+            }
+            else
+            {
+                ComposerHint = "Offline · messages and files will wait for your phone";
             }
         }
     }
@@ -151,12 +172,14 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged
     public Visibility EmptyStateVisibility =>
         Timeline.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
 
+    public Visibility DraftPlaceholderVisibility =>
+        string.IsNullOrEmpty(DraftText) ? Visibility.Visible : Visibility.Collapsed;
+
     private bool CanSendText() =>
-        _sessions.Snapshot.IsConnected
-        && !string.IsNullOrWhiteSpace(DraftText)
+        !string.IsNullOrWhiteSpace(DraftText)
         && Encoding.UTF8.GetByteCount(DraftText) <= BobProtocol.MaxTextBytes;
 
-    private bool CanChooseFiles() => _sessions.Snapshot.IsConnected;
+    private bool CanChooseFiles() => true;
 
     private Task ChooseReceiveDirectoryAsync()
     {
@@ -233,28 +256,54 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged
             return;
         }
 
+        await QueueFilesAsync(dialog.FileNames, kind);
+    }
+
+    public async Task QueueFilesAsync(IEnumerable<string> paths, TransferKind? selectedKind = null)
+    {
         var queued = 0;
-        foreach (var path in dialog.FileNames)
+        var skipped = 0;
+        var folders = false;
+        foreach (var path in paths)
         {
+            if (Directory.Exists(path))
+            {
+                folders = true;
+                continue;
+            }
             try
             {
+                var kind = selectedKind ?? (Path.GetExtension(path).ToLowerInvariant() is
+                    ".avif" or ".bmp" or ".gif" or ".heic" or ".jpeg" or ".jpg" or ".png" or ".webp"
+                    ? TransferKind.Image : TransferKind.File);
                 _transfers.EnqueueOutgoing(path, kind);
                 queued++;
             }
             catch (Exception exception) when (
                 exception is IOException
                     or UnauthorizedAccessException
-                    or ArgumentException)
+                    or ArgumentException
+                    or NotSupportedException
+                    or System.Text.Json.JsonException)
             {
-                ComposerHint = $"Could not queue {Path.GetFileName(path)}.";
+                skipped++;
             }
         }
+
+        ComposerHint = folders ? "Folders are not supported. Zip the folder first."
+            : skipped > 0 ? $"Queued {queued} · {skipped} could not be saved."
+            : $"Queued {queued} {(queued == 1 ? "item" : "items")}"
+                + (_sessions.Snapshot.IsConnected ? "." : " · waiting for your phone.");
 
         if (queued == 0)
         {
             return;
         }
 
+        if (!_sessions.Snapshot.IsConnected)
+        {
+            return;
+        }
         try
         {
             await _sessions.SendNextTransferOfferAsync(_transfers);
@@ -262,9 +311,10 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged
         catch (Exception exception) when (
             exception is InvalidOperationException
                 or IOException
-                or System.Net.WebSockets.WebSocketException)
+                or System.Net.WebSockets.WebSocketException
+                or OperationCanceledException)
         {
-            ComposerHint = "Could not offer the selected content. Check the connection.";
+            ComposerHint = "Content is queued and will be offered when your phone reconnects.";
         }
     }
 
@@ -278,7 +328,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged
             text,
             createdAt,
             outgoing: true,
-            status: "Sending",
+            status: "Queued",
             peerName: _sessions.Snapshot.PeerName ?? "phone",
             copyText: CopyTextToClipboard);
 
@@ -308,20 +358,20 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged
             await _sessions.SendTextAsync(textId, text, createdAt);
             if (_outgoing.ContainsKey(textId))
             {
-                item.Status = "Awaiting confirmation";
-                TryUpdateHistoryStatus(textId, item.Status);
+                item.Status = _sessions.Snapshot.IsConnected ? "Awaiting confirmation" : "Queued";
             }
         }
         catch (Exception exception) when (
             exception is InvalidOperationException
             or IOException
-            or System.Net.WebSockets.WebSocketException)
+                or TextHistoryStoreException
+                or System.Net.WebSockets.WebSocketException
+                or OperationCanceledException)
         {
-            if (_outgoing.Remove(textId))
+            if (_outgoing.ContainsKey(textId))
             {
-                item.Status = "Failed to send";
-                TryUpdateHistoryStatus(textId, item.Status);
-                ComposerHint = "Could not send text. Check the connection and try again.";
+                item.Status = "Queued";
+                ComposerHint = "Message saved · waiting for your phone to reconnect.";
             }
         }
     }
@@ -338,12 +388,16 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged
 
         _connectionRevision = snapshot.Revision;
         ConnectionDetail = snapshot.Detail;
+        if (!string.IsNullOrWhiteSpace(snapshot.PeerName))
+        {
+            ConversationTitle = snapshot.PeerName;
+        }
         switch (snapshot.Phase)
         {
             case SessionPhase.Connected:
-                ConnectionText = $"Phone connected · {snapshot.PeerName}";
+                ConnectionText = "Connected · same Wi-Fi";
                 ConnectionBrush = ConnectedBrush;
-                ComposerHint = "Press Enter for a new line; click Send Text to send";
+                ComposerHint = "Ctrl+Enter to send · Enter for a new line";
                 break;
             case SessionPhase.AwaitingHello:
                 ConnectionText = "Phone is verifying";
@@ -353,7 +407,11 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged
             default:
                 ConnectionText = "Waiting for phone";
                 ConnectionBrush = WaitingBrush;
-                ComposerHint = "Connect a phone to send text";
+                ComposerHint = "Offline · messages and files will wait for your phone";
+                foreach (var item in _outgoing.Values)
+                {
+                    item.Status = "Queued";
+                }
                 break;
         }
 
@@ -378,7 +436,6 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged
             if (_outgoing.TryGetValue(textId, out var item))
             {
                 item.Status = "Delivered";
-                TryUpdateHistoryStatus(textId, item.Status);
                 _outgoing.Remove(textId);
             }
         });
@@ -410,9 +467,14 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged
                 kind: snapshot.Kind,
                 localPath: snapshot.LocalPath,
                 openImage: ShowImagePreview,
-                copyImage: CopyImageToClipboard);
+                copyImage: CopyImageToClipboard,
+                cancel: CancelTransferAsync,
+                retry: RetryTransferAsync,
+                openFile: OpenReceivedFile,
+                recordedAt: snapshot.RecordedAt ?? snapshot.CreatedAt);
+            item.ApplyTransferProgress(snapshot);
             _transferItems.Add(snapshot.TransferId, item);
-            Timeline.Add(item);
+            InsertTimelineItem(item);
             OnPropertyChanged(nameof(EmptyStateVisibility));
             return;
         }
@@ -420,6 +482,53 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged
         item.Detail = detail;
         item.Status = TransferStatus(snapshot);
         item.LocalPath = snapshot.LocalPath;
+        item.ApplyTransferProgress(snapshot);
+    }
+
+    private async Task CancelTransferAsync(Guid transferId)
+    {
+        try
+        {
+            await _sessions.CancelTransferAsync(_transfers, transferId);
+        }
+        catch (Exception exception) when (exception is IOException
+            or UnauthorizedAccessException or InvalidOperationException
+            or System.Net.WebSockets.WebSocketException or OperationCanceledException)
+        {
+            ComposerHint = "Could not finish canceling. Check the item's status.";
+        }
+    }
+
+    private async Task RetryTransferAsync(Guid transferId)
+    {
+        try
+        {
+            _transfers.Retry(transferId);
+            if (_sessions.Snapshot.IsConnected)
+            {
+                await _sessions.SendNextTransferOfferAsync(_transfers);
+            }
+        }
+        catch (Exception exception) when (exception is IOException
+            or UnauthorizedAccessException or InvalidOperationException
+            or ArgumentException or TransferProtocolException
+            or System.Net.WebSockets.WebSocketException or OperationCanceledException)
+        {
+            ComposerHint = "Could not retry. Check that the original file is still available.";
+        }
+    }
+
+    private void OpenReceivedFile(string path)
+    {
+        try
+        {
+            OpenWithShell(path);
+        }
+        catch (Exception exception) when (exception is IOException
+            or UnauthorizedAccessException or Win32Exception or InvalidOperationException)
+        {
+            ComposerHint = "BOB could not open this file.";
+        }
     }
 
     private async void ShowImagePreview(string path)
@@ -508,7 +617,8 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged
             record.Outgoing,
             record.Status,
             record.PeerName,
-            copyText: CopyTextToClipboard);
+            copyText: CopyTextToClipboard,
+            recordedAt: record.RecordedAt);
 
     private void AddVisibleTextItem(TimelineItemViewModel item)
     {
@@ -518,26 +628,25 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged
         }
 
         _textItems.Add(item.TextId, item);
-        Timeline.Add(item);
+        InsertTimelineItem(item);
         while (Timeline.Count(candidate => candidate.IsText) > VisibleTextHistoryLimit)
         {
             var oldestVisibleText = Timeline.First(candidate => candidate.IsText);
             Timeline.Remove(oldestVisibleText);
+            _textItems.Remove(oldestVisibleText.TextId);
         }
 
         OnPropertyChanged(nameof(EmptyStateVisibility));
     }
 
-    private void TryUpdateHistoryStatus(Guid textId, string status)
+    private void InsertTimelineItem(TimelineItemViewModel item)
     {
-        try
+        var index = 0;
+        while (index < Timeline.Count && Timeline[index].RecordedAt <= item.RecordedAt)
         {
-            _textHistory.UpdateStatus(textId, status);
+            index++;
         }
-        catch (TextHistoryStoreException)
-        {
-            ComposerHint = "The message changed state, but its history status could not be saved.";
-        }
+        Timeline.Insert(index, item);
     }
 
     private static void OpenWithShell(string path) =>

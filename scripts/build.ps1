@@ -45,18 +45,19 @@ function Initialize-BobEnvironment {
 
     $toolPaths = @()
 
+    $env:APPDATA = Join-Path $RepoRoot '.build-user\Roaming'
+    $env:LOCALAPPDATA = Join-Path $RepoRoot '.build-user\Local'
+    New-Item -ItemType Directory -Force -Path $env:APPDATA, $env:LOCALAPPDATA | Out-Null
+
     if ($Target -in @('All', 'Windows')) {
         Assert-File -Path $DotnetPath -Label '.NET SDK'
 
         $env:DOTNET_ROOT = Split-Path -Parent $DotnetPath
         $env:DOTNET_CLI_HOME = Join-Path $RepoRoot '.dotnet-home'
         $env:NUGET_PACKAGES = Join-Path $RepoRoot '.nuget\packages'
-        $env:APPDATA = Join-Path $RepoRoot '.build-user\Roaming'
-        $env:LOCALAPPDATA = Join-Path $RepoRoot '.build-user\Local'
         $env:DOTNET_SKIP_FIRST_TIME_EXPERIENCE = '1'
         $env:DOTNET_CLI_TELEMETRY_OPTOUT = '1'
         $env:DOTNET_NOLOGO = '1'
-        New-Item -ItemType Directory -Force -Path $env:APPDATA, $env:LOCALAPPDATA | Out-Null
 
         $toolPaths += $env:DOTNET_ROOT
     }
