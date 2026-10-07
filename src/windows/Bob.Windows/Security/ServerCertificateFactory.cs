@@ -11,7 +11,8 @@ public static class ServerCertificateFactory
     public static X509Certificate2 Create(
         Guid serverId,
         string machineName,
-        DateTimeOffset now)
+        DateTimeOffset now,
+        X509KeyStorageFlags keyStorageFlags = X509KeyStorageFlags.UserKeySet | X509KeyStorageFlags.PersistKeySet)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(machineName);
 
@@ -48,7 +49,7 @@ public static class ServerCertificateFactory
         return X509CertificateLoader.LoadPkcs12(
             generated.Export(X509ContentType.Pfx),
             string.Empty,
-            X509KeyStorageFlags.UserKeySet | X509KeyStorageFlags.PersistKeySet);
+            keyStorageFlags);
     }
 
     private static string EscapeRdn(string value) =>

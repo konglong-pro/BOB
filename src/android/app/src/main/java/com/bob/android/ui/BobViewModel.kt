@@ -3,11 +3,15 @@ package com.bob.android.ui
 import android.app.Application
 import android.net.InetAddresses
 import android.net.Uri
+import androidx.compose.foundation.text.input.InputTransformation
+import androidx.compose.foundation.text.input.TextFieldState
+import androidx.compose.runtime.snapshotFlow
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
-import com.bob.android.application.BobConnectionCoordinator
+import com.bob.android.background.BobTransferRuntime
 import com.bob.android.application.BobConnectionPhase
 import com.bob.android.application.BobConnectionState
+import com.bob.android.application.BobContentSelection
 import com.bob.android.discovery.DiscoveredComputer
 import com.bob.android.discovery.DiscoveryPhase
 import com.bob.android.discovery.DiscoverySnapshot
@@ -18,11 +22,18 @@ import com.bob.android.network.BobTransferKind
 import com.bob.android.persistence.PersistedTextMessage
 import com.bob.android.persistence.TextDeliveryStatus
 import com.bob.android.persistence.TextDirection
+import com.bob.android.persistence.SavedConnectionPreference
+import com.bob.android.persistence.SavedConnectionPreferences
+import com.bob.android.persistence.SavedManualEndpoint
+import com.bob.android.security.BobTrustStore
 import com.bob.android.transfer.OnlineTransferItem
 import com.bob.android.transfer.OnlineTransferState
+import com.bob.android.transfer.OnlineTransferDirection
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.util.UUID
+import java.util.Locale
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -34,13 +45,28 @@ import kotlinx.coroutines.launch
 
 class BobViewModel(application: Application) : AndroidViewModel(application) {
     private val discovery = NsdBobDiscoveryService(application)
-    private val connection = BobConnectionCoordinator(application, viewModelScope)
-    private val selectedTarget = MutableStateFlow<SelectedTarget?>(null)
-    private val manualIp = MutableStateFlow("")
-    private val notice = MutableStateFlow<String?>(null)
-    private val draftText = MutableStateFlow("")
+    private val runtime = BobTransferRuntime.get(application)
+    private val connection = runtime.connection
+    private val connectionPreferences = SavedConnectionPreferences(application)
+    private val trustStore = BobTrustStore(application)
+    private var preferenceReadFailed = false
+    private var savedPreference = try {
+        connectionPreferences.read()
+    } catch (_: Exception) {
+        preferenceReadFailed = true
+        SavedConnectionPreference(autoConnect = false)
+    }
+    private val selectedTarget = MutableStateFlow<SelectedTarget?>(savedPreference.manualEndpoint
+        ?.takeIf { savedPreference.preferManual }
+        ?.let { SelectedTarget.Manual(it.address, it.serverId) })
+    val manualIpInput = TextFieldState(initialText = savedPreference.manualEndpoint?.address.orEmpty())
+    private val notice = MutableStateFlow<String?>(if (preferenceReadFailed)
+        "Could not read saved connection preferences. Automatic connection was paused." else null)
+    val draftInput = TextFieldState()
     private val isQueueingText = MutableStateFlow(false)
-    private var automaticConnectionsEnabled = true
+    private var automaticConnectionsEnabled = savedPreference.autoConnect && !savedPreference.preferManual
+    private var manualReconnectEnabled = savedPreference.autoConnect && savedPreference.preferManual
+    private var userWantsConnection = savedPreference.autoConnect
     private var lastAutomaticEndpointSignature: String? = null
     private var appVisible = false
     private var backgroundDisconnectJob: Job? = null
@@ -48,11 +74,23 @@ class BobViewModel(application: Application) : AndroidViewModel(application) {
     private var draftTargetIdentity: String? = null
     private var draftRevision = 0L
     private var externalContentSelectionDepth = 0
+    private var pendingContentSelection: PendingContentSelection? = null
+
+    // Keep text, selection and IME composition in one synchronous editor state.
+    // The screen flow observes it, but never feeds older text back into the editor.
+    val manualIpTransformation = InputTransformation {
+        if (length > MAX_MANUAL_IP_LENGTH) replace(MAX_MANUAL_IP_LENGTH, length, "")
+        notice.value = null
+    }
+    val draftTransformation = InputTransformation {
+        if (length > MAX_DRAFT_CHARACTERS) replace(MAX_DRAFT_CHARACTERS, length, "")
+        updateDraftOwnership(asCharSequence().toString())
+    }
 
     private val baseInputs = combine(
         discovery.snapshot,
         selectedTarget,
-        manualIp,
+        snapshotFlow { manualIpInput.text.toString() },
         notice,
         connection.state,
     ) { snapshot, selection, manualIpValue, noticeValue, connectionState ->
@@ -61,7 +99,7 @@ class BobViewModel(application: Application) : AndroidViewModel(application) {
 
     val uiState: StateFlow<BobUiState> = combine(
         baseInputs,
-        draftText,
+        snapshotFlow { draftInput.text.toString() },
         isQueueingText,
         connection.textStore.timeline,
         connection.transferItems,
@@ -75,18 +113,33 @@ class BobViewModel(application: Application) : AndroidViewModel(application) {
 
     init {
         viewModelScope.launch {
+            connection.state.collect { state ->
+                rememberSuccessfulManualConnection(state)
+                // A selected session can become idle while the screen stays visible.
+                // Restore its verified target only while the user still wants it.
+                if (state.phase == BobConnectionPhase.Idle) maybeReconnectSelectedTarget()
+            }
+        }
+        viewModelScope.launch {
             discovery.snapshot.collect { snapshot ->
                 reconcileAutomaticSelection(snapshot)
                 maybeConnectAutomatically(snapshot)
+                maybeReconnectSelectedTarget(snapshot)
             }
         }
     }
 
     fun startDiscovery() {
-        appVisible = true
         backgroundDisconnectJob?.cancel()
         backgroundDisconnectJob = null
+        appVisible = true
+        runtime.setVisible(true)
+        if (automaticConnectionsEnabled && !connection.state.value.isConnected) {
+            lastAutomaticEndpointSignature = null
+        }
         discovery.start()
+        maybeReconnectSelectedTarget()
+        maybeConnectAutomatically(discovery.snapshot.value)
     }
 
     fun stopDiscovery() {
@@ -97,13 +150,28 @@ class BobViewModel(application: Application) : AndroidViewModel(application) {
         scheduleBackgroundDisconnect()
     }
 
-    fun beginExternalContentSelection() {
+    fun beginExternalContentSelection(kind: BobTransferKind): Boolean {
+        if (pendingContentSelection != null) return false
+        val authorization = connection.captureContentSelection()
+        if (authorization == null) {
+            notice.value = "Reconnect before selecting content."
+            return false
+        }
+        pendingContentSelection = PendingContentSelection(authorization, kind, selectedTarget.value?.draftIdentity())
         externalContentSelectionDepth += 1
+        runtime.setVisible(true)
         backgroundDisconnectJob?.cancel()
         backgroundDisconnectJob = null
+        return true
     }
 
     fun endExternalContentSelection() {
+        if (pendingContentSelection == null) return
+        pendingContentSelection = null
+        releaseContentSelectionLease()
+    }
+
+    private fun releaseContentSelectionLease() {
         externalContentSelectionDepth = (externalContentSelectionDepth - 1).coerceAtLeast(0)
         if (!appVisible) scheduleBackgroundDisconnect()
     }
@@ -117,7 +185,11 @@ class BobViewModel(application: Application) : AndroidViewModel(application) {
         val peer = discovery.snapshot.value.devices
             .firstOrNull { it.serviceName == key && it.isCompatible }
             ?: return
+        if (!savePreference(savedPreference.copy(preferManual = false, autoConnect = true))) return
         automaticConnectionsEnabled = false
+        manualReconnectEnabled = false
+        userWantsConnection = true
+        automaticConnectJob?.cancel()
         updateSelectedTarget(
             SelectedTarget.Discovered(
                 key = peer.serviceName,
@@ -129,22 +201,21 @@ class BobViewModel(application: Application) : AndroidViewModel(application) {
         connection.connect(peer.toEndpoints())
     }
 
-    fun updateManualIp(value: String) {
-        manualIp.value = value.take(MAX_MANUAL_IP_LENGTH)
-        notice.value = null
-    }
-
     fun useManualIp() {
-        val address = manualIp.value.trim()
+        val address = manualIpInput.text.toString().trim()
         if (address.isEmpty() || !InetAddresses.isNumericAddress(address)) {
             notice.value = "Enter a valid IPv4 or IPv6 address."
             return
         }
 
-        automaticConnectionsEnabled = false
-        updateSelectedTarget(SelectedTarget.Manual(address))
-        notice.value = "Connecting to ${endpoint(address, DEFAULT_PORT)}"
-        connection.connect(BobEndpoint(host = address))
+        val knownId = savedPreference.manualEndpoint?.takeIf { it.address.equals(address, ignoreCase = true) }?.serverId
+            ?: (selectedTarget.value as? SelectedTarget.Manual)
+                ?.takeIf { it.address.equals(address, ignoreCase = true) }?.serverId
+        val target = SelectedTarget.Manual(address, knownId)
+        if (!prepareExplicitConnection(target)) return
+        updateSelectedTarget(target)
+        notice.value = null
+        connection.connect(requireNotNull(resolveEndpoints(target, emptyList())))
     }
 
     fun requestConnection() {
@@ -159,35 +230,127 @@ class BobViewModel(application: Application) : AndroidViewModel(application) {
             notice.value = "This computer is no longer in the discovery results. Search again or enter its IP address."
             return
         }
-        automaticConnectionsEnabled = false
+        if (!prepareExplicitConnection(target)) return
         notice.value = null
         connection.connect(resolved)
     }
 
     fun disconnect() {
         automaticConnectionsEnabled = false
+        manualReconnectEnabled = false
+        userWantsConnection = false
+        automaticConnectJob?.cancel()
+        automaticConnectJob = null
         connection.disconnect("Disconnected by you.")
+        if (!savePreference(savedPreference.copy(autoConnect = false))) {
+            notice.value = "Disconnected. The preference could not be saved, so automatic connection may return after a restart. Restore storage and tap Disconnect again."
+        }
     }
 
     fun resetTrust() {
         automaticConnectionsEnabled = false
+        manualReconnectEnabled = false
+        userWantsConnection = false
+        automaticConnectJob?.cancel()
+        automaticConnectJob = null
+        savePreference(savedPreference.copy(autoConnect = false))
         connection.resetBlockedTrust()
     }
 
-    fun updateDraftText(value: String) {
-        val nextDraft = value.take(MAX_DRAFT_CHARACTERS)
+    private fun savePreference(value: SavedConnectionPreference): Boolean = try {
+        if (preferenceReadFailed || value != savedPreference) connectionPreferences.write(value)
+        savedPreference = value
+        preferenceReadFailed = false
+        true
+    } catch (_: Exception) {
+        automaticConnectionsEnabled = false
+        manualReconnectEnabled = false
+        userWantsConnection = false
+        notice.value = "Could not save connection settings. Automatic connection is paused for this session. Restore storage and try again."
+        false
+    }
+
+    private fun prepareExplicitConnection(target: SelectedTarget): Boolean {
+        val next = when (target) {
+            is SelectedTarget.Discovered -> savedPreference.copy(preferManual = false, autoConnect = true)
+            is SelectedTarget.Manual -> target.serverId?.let { authenticatedId ->
+                savedPreference.copy(manualEndpoint = SavedManualEndpoint(target.address, authenticatedId),
+                    preferManual = true, autoConnect = true)
+            } ?: savedPreference.copy(preferManual = false, autoConnect = false)
+        }
+        // A new address is not remembered until WSS completes. Pause the older saved
+        // target first, so a failed attempt cannot reconnect to a different computer.
+        if (!savePreference(next)) return false
+        automaticConnectionsEnabled = false
+        manualReconnectEnabled = target is SelectedTarget.Manual && target.serverId != null
+        userWantsConnection = true
+        automaticConnectJob?.cancel()
+        automaticConnectJob = null
+        return true
+    }
+
+    private fun rememberSuccessfulManualConnection(state: BobConnectionState) {
+        if (!state.isConnected || !userWantsConnection) return
+        val target = selectedTarget.value as? SelectedTarget.Manual ?: return
+        val authenticatedId = state.serverId ?: return
+        if (!state.endpoint?.host.equals(target.address, ignoreCase = true) ||
+            (target.serverId != null && target.serverId != authenticatedId)) return
+        updateSelectedTarget(target.copy(serverId = authenticatedId))
+        val saved = savedPreference.copy(manualEndpoint = SavedManualEndpoint(target.address, authenticatedId),
+            preferManual = true, autoConnect = true)
+        manualReconnectEnabled = savePreference(saved)
+    }
+
+    private fun maybeReconnectSelectedTarget(snapshot: DiscoverySnapshot = discovery.snapshot.value) {
+        if (!appVisible || !userWantsConnection) return
+        // The connection loop already owns active/retrying sessions. Security and
+        // storage failures remain visible until the user explicitly reconnects.
+        if (connection.state.value.phase != BobConnectionPhase.Idle) return
+        val endpoints = when (val target = selectedTarget.value) {
+            is SelectedTarget.Manual -> {
+                if (!manualReconnectEnabled) return
+                val expectedId = target.serverId ?: return
+                listOf(BobEndpoint(host = target.address, expectedServerId = expectedId))
+            }
+            is SelectedTarget.Discovered -> {
+                if (target.automatic) return
+                val peer = snapshot.devices.firstOrNull {
+                    it.serviceName == target.key && it.deviceId == target.deviceId && it.isCompatible
+                } ?: return
+                peer.toEndpoints()
+            }
+            null -> return
+        }
+        val expectedId = endpoints.firstOrNull()?.expectedServerId ?: return
+        val hasSavedTrust = try {
+            trustStore.find(expectedId) != null
+        } catch (_: Exception) {
+            notice.value = "Could not read saved certificate trust. Automatic connection was paused."
+            manualReconnectEnabled = false
+            userWantsConnection = false
+            return
+        }
+        if (!hasSavedTrust) {
+            manualReconnectEnabled = false
+            userWantsConnection = false
+            notice.value = "Saved certificate trust is missing. Tap Connect to verify this computer again."
+            return
+        }
+        connection.connect(endpoints)
+    }
+
+    private fun updateDraftOwnership(nextDraft: String) {
         draftRevision += 1
         if (nextDraft.isEmpty()) {
             draftTargetIdentity = null
-        } else if (draftText.value.isEmpty() || draftTargetIdentity == null) {
+        } else if (draftInput.text.isEmpty() || draftTargetIdentity == null) {
             draftTargetIdentity = selectedTarget.value?.draftIdentity()
         }
-        draftText.value = nextDraft
         notice.value = null
     }
 
     fun sendText() {
-        val text = draftText.value
+        val text = draftInput.text.toString()
         if (text.trim().isEmpty()) {
             notice.value = "Enter some text."
             return
@@ -224,17 +387,43 @@ class BobViewModel(application: Application) : AndroidViewModel(application) {
         queueContent(uris, BobTransferKind.File)
     }
 
-    private fun queueContent(uris: List<Uri>, kind: BobTransferKind) {
-        if (uris.isEmpty()) return
+    fun cancelTransfer(key: String) {
+        runCatching { UUID.fromString(key) }.getOrNull()?.let(connection::cancelTransfer)
+    }
+
+    fun retryTransfer(key: String) {
         if (!connection.state.value.isConnected) {
-            notice.value = "Reconnect before sending selected content."
+            notice.value = "Reconnect before retrying this file."
             return
         }
+        runCatching { UUID.fromString(key) }.getOrNull()?.let(connection::retryTransfer)
+    }
+
+    private fun queueContent(uris: List<Uri>, kind: BobTransferKind) {
+        val selection = pendingContentSelection
+        pendingContentSelection = null
+        if (selection == null) {
+            if (uris.isNotEmpty()) notice.value = "The computer selection expired. Reconnect and select the content again."
+            return
+        }
+        if (selection.kind != kind || uris.isEmpty()) {
+            if (selection.kind != kind) notice.value = "The content selection expired. Please select it again."
+            releaseContentSelectionLease()
+            return
+        }
+        val selectedUris = uris.toList()
         viewModelScope.launch {
             try {
-                connection.queueTransfers(uris, kind)
+                connection.queueTransfers(selectedUris, kind, selection.authorization)
+                if (selection.targetIdentity != selectedTarget.value?.draftIdentity()) {
+                    notice.value = "Selected content was kept with its original computer. Reconnect to that computer to send it."
+                }
+            } catch (error: CancellationException) {
+                throw error
             } catch (_: Exception) {
-                notice.value = "Could not queue selected content."
+                notice.value = "Could not save all selected content. Check the file history before selecting again."
+            } finally {
+                releaseContentSelectionLease()
             }
         }
     }
@@ -247,6 +436,9 @@ class BobViewModel(application: Application) : AndroidViewModel(application) {
             is SelectedTarget.Discovered -> {
                 val selectedPeer = eligible.firstOrNull { it.serviceName == current.key }
                 when {
+                    // Discovery briefly empties when the screen stops. Keep an
+                    // explicitly chosen identity until that same peer resolves.
+                    !current.automatic -> current
                     selectedPeer != null && eligible.size > 1 && current.automatic &&
                         !connection.state.value.isConnected -> null
                     selectedPeer != null -> current.copy(deviceId = selectedPeer.deviceId)
@@ -277,7 +469,7 @@ class BobViewModel(application: Application) : AndroidViewModel(application) {
     private fun maybeConnectAutomatically(snapshot: DiscoverySnapshot) {
         automaticConnectJob?.cancel()
         automaticConnectJob = null
-        if (!automaticConnectionsEnabled) return
+        if (!appVisible || !automaticConnectionsEnabled) return
         val connectionPhase = connection.state.value.phase
         if (connectionPhase == BobConnectionPhase.Blocked) return
         val eligible = snapshot.devices.filter(DiscoveredComputer::isCompatible)
@@ -305,7 +497,7 @@ class BobViewModel(application: Application) : AndroidViewModel(application) {
             val settled = discovery.snapshot.value.devices
                 .filter(DiscoveredComputer::isCompatible)
                 .singleOrNull()
-            if (settled?.serviceName != peer.serviceName || !automaticConnectionsEnabled) return@launch
+            if (settled?.serviceName != peer.serviceName || !appVisible || !automaticConnectionsEnabled) return@launch
             lastAutomaticEndpointSignature = signature
             val endpoints = settled.toEndpoints()
             val connected = connection.state.value
@@ -349,15 +541,18 @@ class BobViewModel(application: Application) : AndroidViewModel(application) {
             else -> null
         }
         val activeServerId = connectionState.serverId?.toString()
-        val timeline = if (activeServerId == null) {
-            messages.asReversed().take(RECENT_MESSAGE_LIMIT).map(::toTimelineItem)
-        } else {
+            ?: when (selection) {
+                is SelectedTarget.Discovered -> selection.deviceId
+                is SelectedTarget.Manual -> selection.serverId?.toString()
+                null -> null
+            }
+        val timeline = if (activeServerId != null) {
             messages
                 .filter { it.serverId == activeServerId }
                 .asReversed()
                 .take(RECENT_MESSAGE_LIMIT)
                 .map(::toTimelineItem)
-        }
+        } else emptyList()
         val connectionPresentation = presentConnection(connectionState, selection != null)
         val busy = connectionState.phase in setOf(
             BobConnectionPhase.Securing,
@@ -402,7 +597,8 @@ class BobViewModel(application: Application) : AndroidViewModel(application) {
             canChooseContent = connectionState.isConnected,
             isQueueingText = queueing,
             timeline = timeline,
-            transfers = transfers.asReversed().map(::toTransferTimelineItem),
+            transfers = transfers.filter { activeServerId != null && it.serverId == activeServerId }
+                .map(::toTransferTimelineItem),
         )
     }
 
@@ -449,11 +645,14 @@ class BobViewModel(application: Application) : AndroidViewModel(application) {
             statusLabel = status,
             timeLabel = TIME_FORMATTER.format(message.localReceivedAt),
             isOutgoing = outgoing,
+            recordedAtEpochMillis = message.localReceivedAt.toEpochMilli(),
         )
     }
 
     private fun toTransferTimelineItem(item: OnlineTransferItem): TransferTimelineItemUi {
-        val status = when (item.state) {
+        val status = if (item.isSendingCancellation) "Canceling" else if (
+            item.state == OnlineTransferState.Canceled && !item.retryable
+        ) "Cancel pending" else when (item.state) {
             OnlineTransferState.Queued -> "Queued"
             OnlineTransferState.Offered -> "Waiting for computer"
             OnlineTransferState.Accepted -> "Accepted"
@@ -461,9 +660,11 @@ class BobViewModel(application: Application) : AndroidViewModel(application) {
             OnlineTransferState.Verifying -> "Verifying"
             OnlineTransferState.Completed -> "Completed"
             OnlineTransferState.Failed -> "Failed"
+            OnlineTransferState.Canceled -> "Canceled"
         }
         val progress = item.size?.takeIf { it > 0L }?.let { total ->
-            val percent = ((item.bytesTransferred.coerceAtMost(total) * 100L) / total)
+            val percent = (item.bytesTransferred.toDouble() / total.toDouble() * 100.0)
+                .toInt().coerceIn(0, 100)
             "${formatBytes(item.bytesTransferred)} / ${formatBytes(total)} · $percent%"
         } ?: formatBytes(item.bytesTransferred)
         return TransferTimelineItemUi(
@@ -481,13 +682,26 @@ class BobViewModel(application: Application) : AndroidViewModel(application) {
                 ?.takeIf { item.kind == BobTransferKind.Image }
                 ?.toString(),
             errorMessage = item.errorMessage,
+            isOutgoing = item.direction == OnlineTransferDirection.Outgoing,
+            recordedAtEpochMillis = item.recordedAt.toEpochMilli(),
+            timeLabel = TIME_FORMATTER.format(item.recordedAt),
+            bytesTransferred = item.bytesTransferred,
+            totalBytes = item.size,
+            isActive = item.isSendingCancellation || item.state in setOf(OnlineTransferState.Offered, OnlineTransferState.Accepted,
+                OnlineTransferState.Transferring, OnlineTransferState.Verifying),
+            canCancel = item.state !in setOf(OnlineTransferState.Completed, OnlineTransferState.Failed,
+                OnlineTransferState.Canceled),
+            canRetry = item.retryable && item.direction == OnlineTransferDirection.Outgoing &&
+                item.localContentUri != null && item.state in setOf(OnlineTransferState.Failed, OnlineTransferState.Canceled),
         )
     }
 
     private fun formatBytes(bytes: Long): String = when {
-        bytes >= 1024L * 1024L * 1024L -> "%.1f GiB".format(bytes / (1024.0 * 1024.0 * 1024.0))
-        bytes >= 1024L * 1024L -> "%.1f MiB".format(bytes / (1024.0 * 1024.0))
-        bytes >= 1024L -> "%.1f KiB".format(bytes / 1024.0)
+        bytes >= (1L shl 60) -> "%.1f EiB".format(Locale.ROOT, bytes / (1L shl 60).toDouble())
+        bytes >= (1L shl 40) -> "%.1f TiB".format(Locale.ROOT, bytes / (1L shl 40).toDouble())
+        bytes >= 1024L * 1024L * 1024L -> "%.1f GiB".format(Locale.ROOT, bytes / (1024.0 * 1024.0 * 1024.0))
+        bytes >= 1024L * 1024L -> "%.1f MiB".format(Locale.ROOT, bytes / (1024.0 * 1024.0))
+        bytes >= 1024L -> "%.1f KiB".format(Locale.ROOT, bytes / 1024.0)
         else -> "$bytes B"
     }
 
@@ -498,7 +712,7 @@ class BobViewModel(application: Application) : AndroidViewModel(application) {
             // Avoid tearing down a healthy session during a short configuration change.
             delay(BACKGROUND_DISCONNECT_DELAY_MILLIS)
             if (!appVisible && externalContentSelectionDepth == 0) {
-                connection.disconnect("App moved to the background. Local network connection paused.")
+                runtime.setVisible(false)
                 if (automaticConnectionsEnabled) lastAutomaticEndpointSignature = null
             }
         }
@@ -511,7 +725,7 @@ class BobViewModel(application: Application) : AndroidViewModel(application) {
         is SelectedTarget.Discovered -> peers.firstOrNull {
             it.serviceName == target.key && it.isCompatible
         }?.toEndpoints()
-        is SelectedTarget.Manual -> listOf(BobEndpoint(host = target.address))
+        is SelectedTarget.Manual -> listOf(BobEndpoint(host = target.address, expectedServerId = target.serverId))
     }
 
     private fun DiscoveredComputer.toEndpoints(): List<BobEndpoint> = hosts.map { host ->
@@ -535,7 +749,7 @@ class BobViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun updateSelectedTarget(nextTarget: SelectedTarget?) {
         val nextIdentity = nextTarget?.draftIdentity()
-        if (draftText.value.isNotEmpty() && nextIdentity != null) {
+        if (draftInput.text.isNotEmpty() && nextIdentity != null) {
             when (val owner = draftTargetIdentity) {
                 null -> {
                     draftTargetIdentity = nextIdentity
@@ -550,7 +764,7 @@ class BobViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun clearDraft() {
         draftRevision += 1
-        draftText.value = ""
+        draftInput.edit { replace(0, length, "") }
         draftTargetIdentity = null
     }
 
@@ -572,7 +786,7 @@ class BobViewModel(application: Application) : AndroidViewModel(application) {
     override fun onCleared() {
         backgroundDisconnectJob?.cancel()
         automaticConnectJob?.cancel()
-        connection.close()
+        runtime.setVisible(false)
         discovery.close()
         super.onCleared()
     }
@@ -583,6 +797,12 @@ class BobViewModel(application: Application) : AndroidViewModel(application) {
         val manualIp: String,
         val notice: String?,
         val connectionState: BobConnectionState,
+    )
+
+    private data class PendingContentSelection(
+        val authorization: BobContentSelection,
+        val kind: BobTransferKind,
+        val targetIdentity: String?,
     )
 
     private data class ConnectionPresentation(
@@ -598,7 +818,7 @@ class BobViewModel(application: Application) : AndroidViewModel(application) {
             val automatic: Boolean,
         ) : SelectedTarget
 
-        data class Manual(val address: String) : SelectedTarget
+        data class Manual(val address: String, val serverId: UUID? = null) : SelectedTarget
     }
 
     private companion object {

@@ -2,7 +2,7 @@
 title: BOB Transport Protocol v1
 status: active
 version: 1
-updated: 2026-07-11
+updated: 2026-10-07
 ---
 
 # BOB Transport Protocol v1
@@ -320,7 +320,7 @@ snapshot payload 字段：
 - Android 自己尚未提交的 `client_to_server` 队列不依赖服务端快照，welcome 后用原 ID 发送 offer。
 - `terminalAckPending = true` 时，Android 按快照终态字段幂等落库，再发送 `transfer.terminalAck`。
 - Android 本地存在“终态待确认”时，无论 Windows 快照是非终态还是相同终态，Android 都重发原终态消息；Windows 幂等落库后重发 `transfer.terminalAck`。
-- 两端已持久化不同终态时返回 `invalid_state` 并记录诊断；唯一例外是最终内容已经发布时 `completed` 优先。
+- 两端已持久化不同终态时返回 `invalid_state` 并记录诊断；唯一例外是取消与发布竞态中，接收端已经验证并发布最终内容时 `completed` 优先于 `canceled`。已经持久化的 `failed` 不被迟到的 completed 改写。
 - 进程恢复时或确认 HTTP 正文已经中断时，`accepted`/`transferring` 转为 `state = failed`、`error.code = network_interrupted`；v1 不恢复偏移。`verifying` 可在 24 小时窗口内继续 digest/terminal 协调。
 
 ## 8. 文字
@@ -612,7 +612,15 @@ queued
 }
 ```
 
-发送或收到 cancel 的一方都必须立即停止自己的 HTTP 读写并关闭句柄。文件内容接收方拥有未发布临时对象，无论它是 cancel 的发送方还是接收方，都必须删除自己的 Windows `.part` 或 Android pending MediaStore 行。收到 cancel 的一方随后响应：
+主动取消已经发出的项目时，无论发起方是内容发送端还是接收端，都先持久化取消请求、发送控制消息，并在最多 60 秒内保留原 HTTP 正文，等待对端固定的 canceled、failed 或 completed。正文在此期间可以继续，接收端只能写未发布临时对象，不能再发布内容；不能先主动截断正文而使对端生成 network_interrupted。收到固定终态后才关闭正文，接收端删除尚未发布的 Windows `.part` 或 Android pending MediaStore 行。控制连接失效或等待期限到达时释放正文、清理未发布内容并断开控制会话，保留原取消请求用于重连协调，不自行生成新的失败终态。尚未确认的取消仍占用方向队列，不能重试旧项。
+
+收到 cancel 且没有本地待确认取消的一方，先固定终态，再立即停止 HTTP 读写、关闭句柄并响应；接收端同时删除自己的未发布临时对象。未曾 offered 的本地 queued 项可以立即取消，不发送控制消息。双方都已发起取消时遵循下述内容接收端固定 canceledAt 的规则。收到 cancel 的一方随后响应：
+
+取消发起方必须持久保存尚未确认的取消请求，并在重连后重发 cancel，不能自行构造不同时间戳的 canceled 消息作为对端的终态。若收到 cancel 时已存在终态，接收方重放原终态；取消发起方以该回应完成协调。尚待回应的本地取消请求可以由对端已有的 failed 终结，或按发布竞态规则由 completed 终结；收到 canceled 后固定其原 canceledAt，后续重复不得改变。
+
+本地日志中的取消意愿不能当作已经固定的协议终态。Windows 在非终态 `CancelPending` 记录中保存的 `Canceled` 只记录首次请求时间，`TerminalAt` 保持为空；Android 的 `Canceled + cancelPending` 同样表示本地等待意愿。两者在确认前都重发 cancel，不向对端发送自己构造的 canceled；同时取消时内容接收端才把首次请求时间固定为终态。此区别不增加线级字段。
+
+双方同时发起取消且各自仍待回应时，由内容接收端固定自己的原 canceledAt 并重放 canceled，内容发送端保留取消待确认标记、等待该结果，避免双方各用一个时间戳反复冲突。此规则不改变单方取消的响应方式。
 
 ```json
 {
@@ -646,11 +654,14 @@ queued
 
 `message` 只作显示；重试判断以 code 与 `retryable` 为准。
 
+两端可能因同一次正文中断各自产生 `failed`，错误说明可以不同。已有本地产生的 failed 时，首次收到对端 failed 必须单独持久保存其原始错误字段，再按 failed 状态发送 terminalAck；本地历史与本地终态重放仍使用原始本地错误。对端后续重复 failed 必须与已保存的对端错误一致，字段改变返回 `invalid_metadata`。收到对端 failed 才进入终态的记录同样只接受相同错误的重复消息。这些来源信息只在本地日志保存，不增加协议字段。
+
 ## 15. 队列与离线语义
 
 - 同方向按创建顺序 FIFO；只有队首可从 `queued` 进入 `offered`，且在其进入终态前不得 offer 下一项。
 - 方向已经被另一个非终态项目占用时，乱序 offer 或内容请求返回 `direction_busy`。
 - 多选创建多个独立 transfer。
+- Android 已在安全会话中打开的选择器必须保留当时的目标身份；返回时短暂离线可以为原身份建立 queued 项，只在同身份完整 snapshot 后 offer，不把所选内容改投另一台电脑。临时 URI 的有效期仍受下述进程/离线边界约束，不新增正文副本。
 - 文字不受文件队列阻塞。
 - Windows 持久化 Windows→Android 的待发文字、文件路径与元数据，进程重启后仍在。
 - Android 重连后通过 snapshot 取得 Windows 待发文件项目；待确认文字在最后一页后以独立 `text.send` 重放。
@@ -765,6 +776,7 @@ HTTP 错误体：
 - 单个 WSS envelope：1 MiB。
 - 单个 text UTF-8：256 KiB。
 - 文件大小：协议不设人为上限；所有计数使用 int64。
+- 正文不得设置按整个文件计时的总超时。连续 60 秒没有字节进展时，终止当前正文并以 `network_interrupted` 进入失败；不得从偏移恢复。offer 响应与 accepted 后开始正文的等待期限为 60 秒，digest 保留期限仍为第 12 节规定的 24 小时。
 - 每方向活动文件数：1。
 - 进度事件：每传输最多 4/s。
 - 文件内容不得放入 WSS。

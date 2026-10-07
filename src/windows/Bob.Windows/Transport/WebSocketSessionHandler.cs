@@ -117,8 +117,17 @@ public sealed class WebSocketSessionHandler
             }
 
             await lease.SendAsync(CreateWelcome(hello.Id), context.RequestAborted);
-            await lease.SendAsync(CreateEmptySnapshot(), context.RequestAborted);
+            foreach (var snapshot in CreateSnapshots())
+            {
+                await lease.SendAsync(snapshot, context.RequestAborted);
+            }
             lease.CompleteHandshake(client.Name);
+            await _sessions.ReplayPendingTextsAsync(context.RequestAborted);
+            foreach (var replay in _transfers.ReadReplayEnvelopes())
+            {
+                await lease.SendAsync(replay, context.RequestAborted);
+            }
+            await SendNextOutgoingOfferAsync(lease, context.RequestAborted);
 
             while (socket.State == WebSocketState.Open
                 && !context.RequestAborted.IsCancellationRequested)
@@ -166,6 +175,11 @@ public sealed class WebSocketSessionHandler
             lease.SetDisconnectReason("Phone WebSocket connection was interrupted.");
             _logger.LogDebug(exception, "BOB WSS peer disconnected.");
         }
+        catch (IOException)
+        {
+            lease.SetDisconnectReason("BOB could not persist the session state. Reconnect to try again.");
+            await CloseAsync(lease, 4500, "storage_failure", CancellationToken.None);
+        }
         finally
         {
             if (socket.State == WebSocketState.CloseReceived)
@@ -176,6 +190,7 @@ public sealed class WebSocketSessionHandler
                     "closed",
                     CancellationToken.None);
             }
+            _transfers.HandleSessionDisconnected();
         }
     }
 
@@ -238,6 +253,15 @@ public sealed class WebSocketSessionHandler
                 case "transfer.progress":
                     HandleTransferProgress(envelope);
                     break;
+                case "transfer.cancel":
+                    await HandleTransferCancelAsync(lease, envelope, cancellationToken);
+                    break;
+                case "transfer.canceled":
+                    await HandleTransferCanceledAsync(lease, envelope, cancellationToken);
+                    break;
+                case "error":
+                    HandlePeerError(envelope.Payload);
+                    break;
                 default:
                     await SendErrorAsync(
                         lease,
@@ -280,26 +304,10 @@ public sealed class WebSocketSessionHandler
             return;
         }
 
-        IncomingTextRegistration registration;
-        try
-        {
-            registration = _sessions.RegisterIncomingText(
-                textId,
-                text,
-                createdAt,
-                peerName);
-        }
-        catch (TextHistoryStoreException)
-        {
-            await SendErrorAsync(
-                lease,
-                "internal_error",
-                "The received text could not be saved.",
-                retryable: true,
-                envelope.Id,
-                cancellationToken);
-            return;
-        }
+        // Persistence errors leave the original ID unacknowledged and terminate
+        // this session through the outer storage_failure handler. A fresh session
+        // can safely replay it after storage becomes writable again.
+        var registration = _sessions.RegisterIncomingText(textId, text, createdAt, peerName);
         if (registration == IncomingTextRegistration.Conflict)
         {
             await SendErrorAsync(
@@ -322,6 +330,22 @@ public sealed class WebSocketSessionHandler
                 },
                 envelope.Id),
             cancellationToken);
+    }
+
+    private void HandlePeerError(JsonElement payload)
+    {
+        var code = payload.TryGetProperty("code", out var value) && value.ValueKind == JsonValueKind.String
+            ? value.GetString() : null;
+        // Only a small protocol identifier is safe to log. The peer's diagnostic
+        // message may contain text or local paths and is intentionally never logged.
+        if (code is null || code.Length is < 1 or > 64
+            || !code.All(character => character is >= 'a' and <= 'z' or >= '0' and <= '9' or '_'))
+        {
+            code = "invalid_error";
+        }
+        _logger.LogInformation("BOB peer returned protocol error {Code}.", code);
+        // An error describes a rejected message; it is not a transfer terminal.
+        // Replying with another generic error would create an error echo loop.
     }
 
     private async Task HandleTextAckAsync(
@@ -360,6 +384,7 @@ public sealed class WebSocketSessionHandler
                 decision.Completed!),
             IncomingOfferReply.Failed => TransferProtocolMessages.Failed(
                 decision.Failure!),
+            IncomingOfferReply.Canceled => _transfers.ReadTerminalOrCancelEnvelope(offer.TransferId)!,
             _ => throw new InvalidOperationException("Unknown incoming offer decision.")
         };
         await lease.SendAsync(response, cancellationToken);
@@ -382,10 +407,18 @@ public sealed class WebSocketSessionHandler
     {
         var digest = TransferProtocolParser.ParseDigest(envelope.Payload);
         var decision = _transfers.ApplyIncomingDigest(digest);
-        var response = decision.Completed is not null
-            ? TransferProtocolMessages.Completed(decision.Completed)
-            : TransferProtocolMessages.Failed(decision.Failure!);
-        await lease.SendAsync(response, cancellationToken);
+        if (decision.Completed is not null)
+        {
+            await lease.SendAsync(TransferProtocolMessages.Completed(decision.Completed), cancellationToken);
+        }
+        else if (decision.Failure is not null)
+        {
+            await lease.SendAsync(TransferProtocolMessages.Failed(decision.Failure), cancellationToken);
+        }
+        else if (decision.Canceled is not null)
+        {
+            await lease.SendAsync(_transfers.ReadTerminalOrCancelEnvelope(digest.TransferId)!, cancellationToken);
+        }
     }
 
     private async Task HandleTransferCompletedAsync(
@@ -394,7 +427,7 @@ public sealed class WebSocketSessionHandler
         CancellationToken cancellationToken)
     {
         var completed = TransferProtocolParser.ParseCompleted(envelope.Payload);
-        _transfers.ApplyRemoteCompleted(completed);
+        await _transfers.ApplyRemoteCompletedAsync(completed, cancellationToken);
         await lease.SendAsync(
             TransferProtocolMessages.TerminalAck(
                 completed.TransferId,
@@ -439,6 +472,31 @@ public sealed class WebSocketSessionHandler
             progress.Total);
     }
 
+    private async Task HandleTransferCancelAsync(SessionLease lease, ProtocolEnvelope envelope,
+        CancellationToken cancellationToken)
+    {
+        var transferId = TransferProtocolParser.ParseCancel(envelope.Payload);
+        _transfers.Cancel(transferId, requestedByPeer: true);
+        await lease.SendAsync(_transfers.ReadTerminalOrCancelEnvelope(transferId)!, cancellationToken);
+        await SendNextOutgoingOfferAsync(lease, cancellationToken);
+    }
+
+    private async Task HandleTransferCanceledAsync(SessionLease lease, ProtocolEnvelope envelope,
+        CancellationToken cancellationToken)
+    {
+        var canceled = TransferProtocolParser.ParseCanceled(envelope.Payload);
+        var existing = _transfers.ReadTerminalOrCancelEnvelope(canceled.TransferId);
+        if (existing?.Type == "transfer.completed")
+        {
+            await lease.SendAsync(existing, cancellationToken);
+            return;
+        }
+        _transfers.ApplyRemoteCanceled(canceled);
+        await lease.SendAsync(TransferProtocolMessages.TerminalAck(canceled.TransferId,
+            TransferState.Canceled), cancellationToken);
+        await SendNextOutgoingOfferAsync(lease, cancellationToken);
+    }
+
     private async Task SendNextOutgoingOfferAsync(
         SessionLease lease,
         CancellationToken cancellationToken)
@@ -446,9 +504,17 @@ public sealed class WebSocketSessionHandler
         var next = _transfers.TryOfferNextOutgoing();
         if (next is not null)
         {
-            await lease.SendAsync(
+            try
+            {
+                await lease.SendAsync(
                 TransferProtocolMessages.Offer(next),
                 cancellationToken);
+            }
+            catch
+            {
+                _transfers.ReturnOutgoingOfferToQueue(next.TransferId);
+                throw;
+            }
         }
     }
 
@@ -475,16 +541,35 @@ public sealed class WebSocketSessionHandler
             },
             helloId);
 
-    private static ProtocolEnvelope CreateEmptySnapshot() =>
-        ProtocolJson.Create(
-            "session.snapshot",
-            new
+    private IReadOnlyList<ProtocolEnvelope> CreateSnapshots()
+    {
+        var snapshotId = Guid.NewGuid();
+        var pages = new List<List<object>> { new() };
+        foreach (var item in _transfers.ReadSessionSnapshotItems())
+        {
+            var page = pages[^1];
+            page.Add(item);
+            if (ProtocolJson.Serialize(CreateSnapshotPage(snapshotId, pages.Count - 1,
+                isLast: false, page)).Length <= BobProtocol.MaxSnapshotEnvelopeBytes) { continue; }
+            page.RemoveAt(page.Count - 1);
+            if (page.Count == 0)
             {
-                snapshotId = Guid.NewGuid(),
-                page = 0,
-                isLast = true,
-                transfers = Array.Empty<object>()
-            });
+                throw new ProtocolException("Transfer metadata exceeds the snapshot page limit.");
+            }
+            pages.Add(new List<object> { item });
+        }
+        return pages.Select((page, index) => CreateSnapshotPage(snapshotId, index,
+            index == pages.Count - 1, page)).ToArray();
+    }
+
+    private static ProtocolEnvelope CreateSnapshotPage(Guid snapshotId, int page, bool isLast,
+        IReadOnlyList<object> transfers) => ProtocolJson.Create("session.snapshot", new
+        {
+            snapshotId,
+            page,
+            isLast,
+            transfers
+        });
 
     private static async Task<ProtocolEnvelope?> ReceiveEnvelopeAsync(
         WebSocket socket,
@@ -538,8 +623,10 @@ public sealed class WebSocketSessionHandler
 
         if (payload.ValueKind != JsonValueKind.Object
             || !payload.TryGetProperty("protocolMin", out var minValue)
+            || minValue.ValueKind != JsonValueKind.Number
             || !minValue.TryGetInt32(out var minimum)
             || !payload.TryGetProperty("protocolMax", out var maxValue)
+            || maxValue.ValueKind != JsonValueKind.Number
             || !maxValue.TryGetInt32(out var maximum)
             || minimum > maximum
             || !payload.TryGetProperty("client", out var clientValue)

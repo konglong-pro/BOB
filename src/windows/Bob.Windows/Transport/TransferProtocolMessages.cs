@@ -61,6 +61,16 @@ internal static class TransferProtocolMessages
                 retryable = failure.Retryable
             });
 
+    public static ProtocolEnvelope Cancel(Guid transferId) =>
+        ProtocolJson.Create("transfer.cancel", new { transferId, reason = "user" });
+
+    public static ProtocolEnvelope Canceled(TransferCanceled canceled) =>
+        ProtocolJson.Create("transfer.canceled", new
+        {
+            transferId = canceled.TransferId,
+            canceledAt = canceled.CanceledAt
+        });
+
     public static ProtocolEnvelope TerminalAck(Guid transferId, TransferState state) =>
         ProtocolJson.Create(
             "transfer.terminalAck",

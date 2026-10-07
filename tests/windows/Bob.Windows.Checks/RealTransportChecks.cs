@@ -2,8 +2,11 @@ using System.Net;
 using System.Net.Http;
 using System.Net.WebSockets;
 using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Text.Json;
+using Bob.Windows;
+using Bob.Windows.Persistence;
 using Bob.Windows.Domain;
 using Bob.Windows.Security;
 using Bob.Windows.Transport;
@@ -15,7 +18,7 @@ using Microsoft.AspNetCore.Server.Kestrel.Core;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 
-internal static class RealTransportChecks
+internal static partial class RealTransportChecks
 {
     public static async Task CheckTextRoundTripAsync()
     {
@@ -642,28 +645,39 @@ internal static class RealTransportChecks
         private readonly WebApplication _application;
         private readonly ServerIdentity _identity;
         private readonly string _temporaryRoot;
+        private readonly bool _preserveRoot;
+        private readonly string? _temporaryKeyName;
+        private readonly CngProvider? _temporaryKeyProvider;
 
         private TestBobHost(
             WebApplication application,
             ServerIdentity identity,
             Uri baseUri,
             SessionCoordinator sessions,
-            string temporaryRoot)
+            string temporaryRoot,
+            bool preserveRoot,
+            string? temporaryKeyName,
+            CngProvider? temporaryKeyProvider)
         {
             _application = application;
             _identity = identity;
             _temporaryRoot = temporaryRoot;
+            _preserveRoot = preserveRoot;
+            _temporaryKeyName = temporaryKeyName;
+            _temporaryKeyProvider = temporaryKeyProvider;
             BaseUri = baseUri;
             Sessions = sessions;
         }
 
         public Guid ServerId => _identity.ServerId;
 
+        public string CertificatePin => _identity.CertificatePin;
+
         public Uri BaseUri { get; }
 
         public Uri WebSocketUri => new UriBuilder(BaseUri)
         {
-            Scheme = "ws",
+            Scheme = BaseUri.Scheme == "https" ? "wss" : "ws",
             Path = "/bob/v1/ws"
         }.Uri;
 
@@ -676,40 +690,55 @@ internal static class RealTransportChecks
 
         public string TemporaryRoot => _temporaryRoot;
 
-        public static async Task<TestBobHost> StartAsync()
+        public static async Task<TestBobHost> StartAsync(string? existingRoot = null,
+            bool durable = false, bool preserveRoot = false, bool tls = false)
         {
-            var temporaryRoot = Path.Combine(
+            var temporaryRoot = existingRoot ?? Path.Combine(
                 Path.GetTempPath(),
                 $"bob-windows-checks-{Guid.NewGuid():N}");
             var receiveDirectory = Path.Combine(temporaryRoot, "received");
             Directory.CreateDirectory(temporaryRoot);
             var serverId = Guid.NewGuid();
-            var identity = new ServerIdentity(
-                serverId,
-                ServerCertificateFactory.Create(serverId, "localhost", DateTimeOffset.UtcNow));
-            var builder = WebApplication.CreateBuilder(new WebApplicationOptions
-            {
-                ApplicationName = typeof(BobEndpoints).Assembly.FullName,
-                ContentRootPath = AppContext.BaseDirectory
-            });
-            builder.Logging.ClearProviders();
-            builder.WebHost.ConfigureKestrel(options =>
-            {
-                options.Listen(IPAddress.Loopback, 0, listen =>
-                {
-                    listen.Protocols = HttpProtocols.Http1AndHttp2;
-                });
-            });
-            builder.Services.AddSingleton(identity);
-            builder.Services.AddSingleton<SessionCoordinator>();
-            builder.Services.AddSingleton(new TransferCoordinator(receiveDirectory));
-            builder.Services.AddSingleton<WebSocketSessionHandler>();
-
-            var application = builder.Build();
-            BobEndpoints.Map(application);
-
+            string? temporaryKeyName = null;
+            CngProvider? temporaryKeyProvider = null;
+            ServerIdentity? identity = null;
+            WebApplication? application = null;
             try
             {
+                var certificate = tls
+                    ? CreateTemporaryTlsCertificate(serverId, out temporaryKeyName, out temporaryKeyProvider)
+                    : ServerCertificateFactory.Create(serverId, "localhost", DateTimeOffset.UtcNow,
+                        X509KeyStorageFlags.EphemeralKeySet);
+                identity = new ServerIdentity(serverId, certificate);
+                var builder = WebApplication.CreateBuilder(new WebApplicationOptions
+                {
+                    ApplicationName = typeof(BobEndpoints).Assembly.FullName,
+                    ContentRootPath = AppContext.BaseDirectory
+                });
+                builder.Logging.ClearProviders();
+                builder.WebHost.ConfigureKestrel(options =>
+                {
+                    options.Listen(IPAddress.Loopback, 0, listen =>
+                    {
+                        listen.Protocols = HttpProtocols.Http1AndHttp2;
+                        if (tls) { listen.UseHttps(identity.Certificate); }
+                    });
+                });
+                builder.Services.AddSingleton(identity);
+                if (durable)
+                {
+                    var paths = new AppPaths(Path.Combine(temporaryRoot, "data"),
+                        Path.Combine(temporaryRoot, "data", "identity"));
+                    builder.Services.AddSingleton(paths);
+                    builder.Services.AddSingleton<TextHistoryStore>();
+                    builder.Services.AddSingleton(new TransferCoordinator(receiveDirectory, paths));
+                }
+                else { builder.Services.AddSingleton(new TransferCoordinator(receiveDirectory)); }
+                builder.Services.AddSingleton<SessionCoordinator>();
+                builder.Services.AddSingleton<WebSocketSessionHandler>();
+
+                application = builder.Build();
+                BobEndpoints.Map(application);
                 await application.StartAsync();
                 var addresses = application.Services
                     .GetRequiredService<IServer>()
@@ -723,40 +752,116 @@ internal static class RealTransportChecks
                     identity,
                     new Uri(address),
                     application.Services.GetRequiredService<SessionCoordinator>(),
-                    temporaryRoot);
+                    temporaryRoot,
+                    preserveRoot,
+                    temporaryKeyName,
+                    temporaryKeyProvider);
             }
             catch
             {
-                await application.DisposeAsync();
-                TryDeleteDirectory(temporaryRoot);
+                try
+                {
+                    if (application is not null) { await application.DisposeAsync(); }
+                }
+                finally
+                {
+                    identity?.Dispose();
+                    try { DeleteOwnedTestKey(temporaryKeyName, temporaryKeyProvider); }
+                    finally { if (!preserveRoot) { TryDeleteDirectory(temporaryRoot); } }
+                }
                 throw;
             }
+        }
+
+        private static X509Certificate2 CreateTemporaryTlsCertificate(Guid serverId,
+            out string? ownedKeyName, out CngProvider? ownedProvider)
+        {
+            ownedKeyName = null;
+            ownedProvider = null;
+            var name = $"BOB-TLS-check-{Guid.NewGuid():N}";
+            var provider = CngProvider.MicrosoftSoftwareKeyStorageProvider;
+            // Schannel cannot use an ephemeral key. Create exactly one fresh named
+            // container, with no overwrite flag, and retain its identity for cleanup.
+            using var key = CngKey.Create(CngAlgorithm.Rsa, name, new CngKeyCreationParameters
+            {
+                Provider = provider,
+                Parameters = { new CngProperty("Length", BitConverter.GetBytes(3072), CngPropertyOptions.None) }
+            });
+            ownedKeyName = name;
+            ownedProvider = provider;
+            using var rsa = new RSACng(key);
+            var now = DateTimeOffset.UtcNow;
+            var request = new CertificateRequest($"CN=BOB-TLS-check-{serverId:N}", rsa,
+                HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+            request.CertificateExtensions.Add(new X509BasicConstraintsExtension(false, false, 0, true));
+            request.CertificateExtensions.Add(new X509KeyUsageExtension(X509KeyUsageFlags.DigitalSignature, true));
+            request.CertificateExtensions.Add(new X509EnhancedKeyUsageExtension(
+                new OidCollection { new Oid("1.3.6.1.5.5.7.3.1") }, true));
+            var san = new SubjectAlternativeNameBuilder();
+            san.AddDnsName("localhost");
+            san.AddIpAddress(IPAddress.Loopback);
+            san.AddIpAddress(IPAddress.IPv6Loopback);
+            request.CertificateExtensions.Add(san.Build());
+            return request.CreateSelfSigned(now.AddDays(-1), now.AddDays(1));
         }
 
         public ClientWebSocket CreateWebSocketClient()
         {
             var socket = new ClientWebSocket();
             socket.Options.AddSubProtocol(BobProtocol.Subprotocol);
+            if (BaseUri.Scheme == "https")
+            {
+                socket.Options.RemoteCertificateValidationCallback = (_, certificate, _, _) =>
+                    certificate is not null && Base64Url(SHA256.HashData(certificate.GetRawCertData()))
+                        == CertificatePin;
+            }
             return socket;
         }
 
         public async ValueTask DisposeAsync()
         {
             using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
-            await _application.StopAsync(timeout.Token);
-            await _application.DisposeAsync();
-            TryDeleteDirectory(_temporaryRoot);
+            try { await _application.StopAsync(timeout.Token); }
+            finally
+            {
+                try { await _application.DisposeAsync(); }
+                finally
+                {
+                    _identity.Dispose();
+                    try { DeleteOwnedTestKey(_temporaryKeyName, _temporaryKeyProvider); }
+                    finally { if (!_preserveRoot) { TryDeleteDirectory(_temporaryRoot); } }
+                }
+            }
         }
 
         private static void TryDeleteDirectory(string path)
         {
+            var absolute = Path.GetFullPath(path);
+            var name = Path.GetFileName(absolute);
+            Ensure(string.Equals(Path.GetDirectoryName(absolute), Path.TrimEndingDirectorySeparator(Path.GetTempPath()),
+                StringComparison.OrdinalIgnoreCase) && (name.StartsWith("bob-windows-checks-", StringComparison.Ordinal)
+                    || name.StartsWith("bob-windows-reliability-", StringComparison.Ordinal)),
+                "Test cleanup must remain inside its dedicated temporary directory.");
             try
             {
-                Directory.Delete(path, recursive: true);
+                Directory.Delete(absolute, recursive: true);
             }
             catch (DirectoryNotFoundException)
             {
             }
+        }
+
+        private static void DeleteOwnedTestKey(string? keyName, CngProvider? provider)
+        {
+            // These values come only from the freshly generated test certificate.
+            // Never enumerate the user's existing key store or touch other containers.
+            if (keyName is null || provider is null) { return; }
+            if (CngKey.Exists(keyName, provider))
+            {
+                using var key = CngKey.Open(keyName, provider);
+                key.Delete();
+            }
+            Ensure(!CngKey.Exists(keyName, provider), "The temporary TLS test key was not deleted.");
         }
     }
 }

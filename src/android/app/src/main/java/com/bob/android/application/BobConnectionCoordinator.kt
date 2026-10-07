@@ -3,6 +3,7 @@ package com.bob.android.application
 import android.content.Context
 import android.net.Uri
 import android.os.Build
+import android.util.Log
 import com.bob.android.network.BobEndpoint
 import com.bob.android.network.BobHttpsConnection
 import com.bob.android.network.BobHttpsConnector
@@ -13,8 +14,11 @@ import com.bob.android.network.BobSessionCloseCause
 import com.bob.android.network.BobSessionClosure
 import com.bob.android.network.BobSessionPhase
 import com.bob.android.network.BobSessionState
+import com.bob.android.network.BobSnapshotPage
 import com.bob.android.network.BobTextAcknowledgement
 import com.bob.android.network.BobTransferAccepted
+import com.bob.android.network.BobTransferCancel
+import com.bob.android.network.BobTransferCanceled
 import com.bob.android.network.BobTransferCompleted
 import com.bob.android.network.BobTransferDigest
 import com.bob.android.network.BobTransferFailed
@@ -28,6 +32,7 @@ import com.bob.android.persistence.AtomicTextMessageStore
 import com.bob.android.persistence.PersistedTextMessage
 import com.bob.android.persistence.TextDirection
 import com.bob.android.persistence.TextMessageConflictException
+import com.bob.android.persistence.TransferJournalException
 import com.bob.android.security.BobCertificatePinMismatchException
 import com.bob.android.security.BobCertificateValidationException
 import com.bob.android.security.BobIdentityMismatchException
@@ -37,6 +42,7 @@ import com.bob.android.security.BobServerInfoException
 import com.bob.android.security.BobTrustConflictException
 import com.bob.android.security.BobTrustStore
 import com.bob.android.transfer.OnlineTransferCoordinator
+import com.bob.android.transfer.TransferIoException
 import java.io.Closeable
 import java.io.IOException
 import java.net.ConnectException
@@ -45,11 +51,16 @@ import java.net.SocketTimeoutException
 import java.net.UnknownHostException
 import java.time.Instant
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicBoolean
 import javax.net.ssl.SSLHandshakeException
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.async
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -89,6 +100,14 @@ data class BobConnectionState(
         get() = phase == BobConnectionPhase.Blocked && serverId != null && trustResetAllowed
 }
 
+/** A single picker batch authorized while this process had an authenticated session. */
+class BobContentSelection internal constructor(
+    val serverId: UUID,
+    internal val owner: BobConnectionCoordinator,
+) {
+    internal val consumed = AtomicBoolean(false)
+}
+
 /** Owns exactly one pinned HTTPS/WSS connection and its durable text outbox. */
 class BobConnectionCoordinator(
     context: Context,
@@ -102,7 +121,12 @@ class BobConnectionCoordinator(
     private val outboxMutex = Mutex()
     private val mutableState = MutableStateFlow(BobConnectionState())
     val state: StateFlow<BobConnectionState> = mutableState.asStateFlow()
-    private val transferCoordinator = OnlineTransferCoordinator(applicationContext, scope)
+    private var transferStorageMessage: String? = null
+    private val transferCoordinator = OnlineTransferCoordinator(applicationContext, scope) { error ->
+        transferStorageMessage = error.message
+        mutableState.value = mutableState.value.copy(phase = BobConnectionPhase.Failed,
+            message = error.message ?: "File transfer storage is unavailable. Existing data was kept.")
+    }
     val transferItems = transferCoordinator.items
 
     private var generation = 0L
@@ -111,6 +135,7 @@ class BobConnectionCoordinator(
     private var transportGeneration: Long? = null
     private var httpsConnection: BobHttpsConnection? = null
     private var webSocketSession: BobWebSocketSession? = null
+    private var transportCleanup: Deferred<Unit>? = null
     private var trustResetInProgress = false
     private var closed = false
 
@@ -129,6 +154,7 @@ class BobConnectionCoordinator(
 
         generation += 1
         val connectionGeneration = generation
+        transferStorageMessage = null
         requestedEndpoints = distinctEndpoints
         connectionJob?.cancel()
         closeTransport()
@@ -248,12 +274,38 @@ class BobConnectionCoordinator(
         return message
     }
 
-    suspend fun queueTransfers(uris: List<Uri>, kind: BobTransferKind) {
-        if (!mutableState.value.isConnected) {
-            throw IllegalStateException("Secure session is not connected.")
-        }
-        transferCoordinator.queueOutgoing(uris, kind)
+    fun captureContentSelection(): BobContentSelection? {
+        val current = mutableState.value
+        val connection = httpsConnection ?: return null
+        val session = webSocketSession ?: return null
+        val serverId = current.serverId ?: return null
+        if (closed || !current.isConnected || connection.serverInfo.serverId != serverId ||
+            session.state.phase != BobSessionPhase.Connected) return null
+        return BobContentSelection(serverId, this)
     }
+
+    suspend fun queueTransfers(uris: List<Uri>, kind: BobTransferKind) {
+        val selection = captureContentSelection()
+            ?: throw IllegalStateException("Secure session is not connected.")
+        queueTransfers(uris, kind, selection)
+    }
+
+    suspend fun queueTransfers(uris: List<Uri>, kind: BobTransferKind, selection: BobContentSelection) {
+        check(!closed && selection.owner === this && selection.consumed.compareAndSet(false, true)) {
+            "The authenticated content selection expired."
+        }
+        // The selection carries the original authenticated identity. A socket change
+        // during the picker or metadata read must neither discard it nor retarget it.
+        transferCoordinator.queueOutgoing(uris, kind, selection.serverId)
+    }
+
+    fun cancelTransfer(transferId: UUID) = transferCoordinator.cancel(transferId)
+
+    fun retryTransfer(transferId: UUID) = transferCoordinator.retry(transferId)
+
+    fun abortActiveTransfers(message: String) = transferCoordinator.abortActive(message)
+
+    fun pauseBackgroundTransfers(message: String) = transferCoordinator.abortActive(message, preserveVerifying = true)
 
     private suspend fun runConnectionLoop(
         connectionGeneration: Long,
@@ -273,6 +325,18 @@ class BobConnectionCoordinator(
                 ?: endpoints
             var outcome: ConnectionOutcome = ConnectionOutcome.Retry("Connection failed")
             for ((index, endpoint) in candidates.withIndex()) {
+                try {
+                    awaitTransportCleanup()
+                } catch (error: CancellationException) {
+                    throw error
+                } catch (error: Throwable) {
+                    if (isCurrent(connectionGeneration)) {
+                        mutableState.value = mutableState.value.copy(phase = BobConnectionPhase.Failed,
+                            message = "Could not release the previous network connection. Try connecting again.")
+                    }
+                    return
+                }
+                if (!isCurrent(connectionGeneration)) return
                 mutableState.value = BobConnectionState(
                     phase = BobConnectionPhase.Securing,
                     endpoint = endpoint,
@@ -303,6 +367,8 @@ class BobConnectionCoordinator(
                     httpsConnection = established
                     outcome = runWebSocket(connectionGeneration, established)
                     break
+                } catch (error: CancellationException) {
+                    throw error
                 } catch (error: Throwable) {
                     closeTransport(connectionGeneration)
                     if (!isCurrent(connectionGeneration)) return
@@ -347,6 +413,7 @@ class BobConnectionCoordinator(
                 }
             }
 
+            if (mutableState.value.isConnected) attempt = 0
             closeTransport(connectionGeneration)
             if (!isCurrent(connectionGeneration)) return
             when (outcome) {
@@ -374,6 +441,8 @@ class BobConnectionCoordinator(
     ): ConnectionOutcome {
         val terminal = CompletableDeferred<BobSessionClosure>()
         var lastFailureMessage: String? = null
+        var lastFailure: Throwable? = null
+        val snapshotTransfers = mutableListOf<String>()
         lateinit var session: BobWebSocketSession
         val listener = object : BobWebSocketSession.Listener {
             override fun onStateChanged(state: BobSessionState) {
@@ -406,13 +475,19 @@ class BobConnectionCoordinator(
                 )
             }
 
+            override fun onSnapshotPage(page: BobSnapshotPage) {
+                if (isCurrentSession(connectionGeneration, session)) snapshotTransfers.addAll(page.transfersJson)
+            }
+
             override fun onConnected(welcome: BobWelcome) {
                 if (!isCurrentSession(connectionGeneration, session)) return
                 // The server may send a transfer.offer immediately after the final snapshot.
                 // Attach before any persistence suspension so that first offer cannot be lost.
-                transferCoordinator.attach(connection, session)
+                val attached = transferCoordinator.attach(connection, session, snapshotTransfers.toList())
+                snapshotTransfers.clear()
                 scope.launch {
                     try {
+                        attached.await()
                         outboxMutex.withLock {
                             withContext(Dispatchers.IO) {
                                 textStore.prepareOutgoingForReconnect(welcome.serverId.toString())
@@ -433,12 +508,18 @@ class BobConnectionCoordinator(
                             welcome.serverId,
                         )
                         drainOutbox(connectionGeneration, session, welcome.serverId)
+                    } catch (error: CancellationException) {
+                        throw error
+                    } catch (error: TransferIoException) {
+                        if (isCurrentSession(connectionGeneration, session)) session.close(4400, error.code)
                     } catch (error: Exception) {
                         if (isCurrentSession(connectionGeneration, session)) {
                             mutableState.value = mutableState.value.copy(
-                                message = error.userMessage("Could not restore text queue"),
+                                phase = BobConnectionPhase.Failed,
+                                message = if (error is TransferJournalException) error.message
+                                    else "Could not restore saved text. Existing history was kept. Restore storage and reconnect.",
                             )
-                            session.close(4400, "persistence_failed")
+                            session.close(4500, "persistence_failed")
                         }
                     }
                 }
@@ -469,9 +550,10 @@ class BobConnectionCoordinator(
                         }
                     } catch (error: Exception) {
                         if (isCurrentSession(connectionGeneration, session)) {
-                            session.close(4400, "persistence_failed")
+                            session.close(4500, "text_storage_failure")
                             mutableState.value = mutableState.value.copy(
-                                message = error.userMessage("Could not save received text"),
+                                phase = BobConnectionPhase.Failed,
+                                message = "Could not save received text. Existing history was kept. Restore storage and reconnect.",
                             )
                         }
                     }
@@ -492,8 +574,10 @@ class BobConnectionCoordinator(
                     } catch (error: Exception) {
                         if (isCurrentSession(connectionGeneration, session)) {
                             mutableState.value = mutableState.value.copy(
-                                message = error.userMessage("Acknowledgement received, but delivery status could not be saved"),
+                                phase = BobConnectionPhase.Failed,
+                                message = "Delivery was acknowledged, but its status could not be saved. Restore storage and reconnect.",
                             )
+                            session.close(4500, "text_storage_failure")
                         }
                     }
                 }
@@ -541,8 +625,17 @@ class BobConnectionCoordinator(
                 }
             }
 
+            override fun onTransferCancel(cancel: BobTransferCancel) {
+                if (isCurrentSession(connectionGeneration, session)) transferCoordinator.onCancel(cancel)
+            }
+
+            override fun onTransferCanceled(canceled: BobTransferCanceled) {
+                if (isCurrentSession(connectionGeneration, session)) transferCoordinator.onCanceled(canceled)
+            }
+
             override fun onRemoteError(error: BobRemoteError) {
                 if (!isCurrentSession(connectionGeneration, session)) return
+                transferCoordinator.onRemoteError(error)
                 mutableState.value = mutableState.value.copy(
                     message = error.uiMessage(),
                 )
@@ -550,6 +643,7 @@ class BobConnectionCoordinator(
 
             override fun onFailure(error: Throwable, httpStatus: Int?) {
                 if (!isCurrentSession(connectionGeneration, session)) return
+                lastFailure = error
                 val suffix = httpStatus?.let { " (HTTP $it)" }.orEmpty()
                 lastFailureMessage =
                     error.userMessage("WSS connection failed", connection.endpoint) + suffix
@@ -584,11 +678,29 @@ class BobConnectionCoordinator(
         )
         val started = session.connect()
         if (!started && session.state.closure == null) {
-            session.dispose()
+            withContext(Dispatchers.IO + NonCancellable) { session.dispose() }
             return ConnectionOutcome.Retry("Could not start WSS session")
         }
 
         val closure = terminal.await()
+        if (closure.reason == "persistence_failed") {
+            mutableState.value = mutableState.value.copy(phase = BobConnectionPhase.Failed,
+                message = transferStorageMessage ?: mutableState.value.message
+                    ?: "Saved history could not be read or written. Existing data was kept. Restore storage and reconnect.")
+            return ConnectionOutcome.Stop
+        }
+        if (closure.reason == "text_storage_failure") {
+            return ConnectionOutcome.Retry("Local text storage is unavailable. Existing history was kept")
+        }
+        if (lastFailure?.isTrustOrIdentityFailure() == true) {
+            val failure = requireNotNull(lastFailure)
+            mutableState.value = mutableState.value.copy(
+                phase = BobConnectionPhase.Blocked,
+                message = failure.userMessage("Certificate or computer identity verification failed", connection.endpoint),
+                trustResetAllowed = failure.allowsTrustReset(),
+            )
+            return ConnectionOutcome.Stop
+        }
         return when {
             closure.cause == BobSessionCloseCause.UnsupportedVersion -> ConnectionOutcome.Stop.also {
                 mutableState.value = mutableState.value.copy(
@@ -716,13 +828,60 @@ class BobConnectionCoordinator(
     private fun closeTransport(ownerGeneration: Long? = null) {
         if (ownerGeneration != null && transportGeneration != ownerGeneration) return
         val session = webSocketSession
-        webSocketSession = null
-        if (session != null) transferCoordinator.detach(session)
-        session?.dispose()
         val connection = httpsConnection
+        // Detach every coordinator reference on its owner thread before any blocking
+        // cleanup. Callbacks and an overlapping connect can no longer see this pair.
+        webSocketSession = null
         httpsConnection = null
         transportGeneration = null
-        connection?.close()
+        if (session == null && connection == null) return
+        val cleanupGeneration = generation
+        val previousCleanup = transportCleanup
+        // Cleanup deliberately outlives the canceled connection job and owner scope.
+        val cleanup = scope.async<Unit>(Dispatchers.IO + NonCancellable) {
+            previousCleanup?.join()
+            var failure: Throwable? = null
+            try {
+                if (session != null) transferCoordinator.detach(session)
+            } catch (error: Throwable) {
+                failure = error
+            }
+            try {
+                session?.dispose()
+            } catch (error: Throwable) {
+                val first = failure
+                if (first == null) failure = error else if (first !== error) first.addSuppressed(error)
+            }
+            try {
+                connection?.close()
+            } catch (error: Throwable) {
+                val first = failure
+                if (first == null) failure = error else if (first !== error) first.addSuppressed(error)
+            }
+            failure?.let { throw it }
+        }
+        transportCleanup = cleanup
+        cleanup.invokeOnCompletion { error ->
+            if (error != null) {
+                Log.e("BOB", "Failed to release an obsolete network connection", error)
+                scope.launch {
+                    if (isCurrent(cleanupGeneration) && mutableState.value.phase == BobConnectionPhase.Idle) {
+                        mutableState.value = mutableState.value.copy(phase = BobConnectionPhase.Failed,
+                            message = "Could not release the previous network connection. Try connecting again.")
+                    }
+                }
+            }
+        }
+    }
+
+    private suspend fun awaitTransportCleanup() {
+        val cleanup = transportCleanup ?: return
+        try {
+            cleanup.await()
+        } finally {
+            // Cancellation of a connect does not cancel or forget in-flight releases.
+            if (cleanup.isCompleted && transportCleanup === cleanup) transportCleanup = null
+        }
     }
 
     private fun appVersion(): String = runCatching {
@@ -752,6 +911,7 @@ class BobConnectionCoordinator(
             BobConnectionPhase.OpeningSession,
             BobConnectionPhase.Synchronizing,
             BobConnectionPhase.Connected,
+            BobConnectionPhase.Retrying,
         )
         val RETRY_SECONDS = intArrayOf(1, 2, 4, 8, 15)
     }

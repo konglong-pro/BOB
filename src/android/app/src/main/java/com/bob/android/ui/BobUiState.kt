@@ -29,6 +29,7 @@ data class TextTimelineItemUi(
     val statusLabel: String,
     val timeLabel: String,
     val isOutgoing: Boolean,
+    val recordedAtEpochMillis: Long = 0,
 )
 
 data class TransferTimelineItemUi(
@@ -40,6 +41,14 @@ data class TransferTimelineItemUi(
     val progressLabel: String,
     val previewUri: String?,
     val errorMessage: String?,
+    val isOutgoing: Boolean = false,
+    val recordedAtEpochMillis: Long = 0,
+    val timeLabel: String = "",
+    val bytesTransferred: Long = 0,
+    val totalBytes: Long? = null,
+    val isActive: Boolean = false,
+    val canCancel: Boolean = false,
+    val canRetry: Boolean = false,
 )
 
 data class BobUiState(

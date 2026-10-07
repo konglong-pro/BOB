@@ -52,6 +52,10 @@ public sealed record TransferFailure(
     string Message,
     bool Retryable);
 
+public sealed record TransferCanceled(
+    Guid TransferId,
+    DateTimeOffset CanceledAt);
+
 public sealed record TransferSnapshot(
     Guid TransferId,
     long Revision,
@@ -67,34 +71,46 @@ public sealed record TransferSnapshot(
     string? StoredName,
     string? ErrorCode,
     string? ErrorMessage,
-    string? LocalPath);
+    string? LocalPath,
+    bool Retryable = false,
+    Guid? RetryOf = null,
+    DateTimeOffset? TerminalAt = null,
+    bool TerminalAckPending = false,
+    string? Sha256 = null,
+    DateTimeOffset? RecordedAt = null,
+    bool CancelPending = false);
 
 public enum IncomingOfferReply
 {
     Accepted,
     Completed,
-    Failed
+    Failed,
+    Canceled
 }
 
 public sealed record IncomingOfferDecision(
     IncomingOfferReply Reply,
     string? PlannedName = null,
     TransferCompleted? Completed = null,
-    TransferFailure? Failure = null);
+    TransferFailure? Failure = null,
+    TransferCanceled? Canceled = null);
 
 public sealed record IncomingDigestDecision(
     TransferCompleted? Completed = null,
-    TransferFailure? Failure = null);
+    TransferFailure? Failure = null,
+    TransferCanceled? Canceled = null);
 
 public sealed record IncomingContent(
     Stream Stream,
-    long? ExpectedSize);
+    long? ExpectedSize,
+    CancellationToken CancellationToken = default);
 
 public sealed record OutgoingContent(
     Stream Stream,
     string Name,
     string MediaType,
-    long Size);
+    long Size,
+    CancellationToken CancellationToken = default);
 
 public sealed class TransferProtocolException : Exception
 {

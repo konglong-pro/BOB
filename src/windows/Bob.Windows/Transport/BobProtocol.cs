@@ -8,6 +8,7 @@ public static class BobProtocol
     public const int DefaultPort = 42424;
     public const string Subprotocol = "bob.v1";
     public const int MaxEnvelopeBytes = 1024 * 1024;
+    public const int MaxSnapshotEnvelopeBytes = 768 * 1024;
     public const int MaxTextBytes = 256 * 1024;
     public const int HeartbeatSeconds = 20;
     public const int PeerTimeoutSeconds = 60;

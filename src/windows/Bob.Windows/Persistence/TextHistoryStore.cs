@@ -115,20 +115,15 @@ public sealed class TextHistoryStore
     {
         try
         {
-            if (!File.Exists(_historyPath))
-            {
-                return [];
-            }
-
             var document = JsonSerializer.Deserialize<HistoryDocument>(
                 File.ReadAllText(_historyPath),
                 JsonOptions);
             if (document is null || document.SchemaVersion != SchemaVersion)
             {
-                return [];
+                throw new JsonException("Unsupported text history.");
             }
 
-            var records = document.Messages ?? [];
+            var records = document.Messages ?? throw new JsonException("Text messages are missing.");
             foreach (var record in records)
             {
                 Validate(record);
@@ -136,10 +131,14 @@ public sealed class TextHistoryStore
 
             if (records.Select(record => record.TextId).Distinct().Count() != records.Count)
             {
-                return [];
+                throw new JsonException("Text history contains duplicate IDs.");
             }
 
             return Order(records);
+        }
+        catch (Exception exception) when (exception is FileNotFoundException or DirectoryNotFoundException)
+        {
+            return [];
         }
         catch (Exception exception) when (
             exception is IOException
@@ -148,20 +147,21 @@ public sealed class TextHistoryStore
                 or ArgumentException
                 or NotSupportedException)
         {
-            return [];
+            throw new TextHistoryStoreException("Unable to read the text history. The original data was kept.",
+                exception);
         }
     }
 
     private void Persist(IReadOnlyList<TextHistoryRecord> records)
     {
         var directory = Path.GetDirectoryName(_historyPath)!;
-        Directory.CreateDirectory(directory);
         var temporaryPath = Path.Combine(
             directory,
             $".{HistoryFileName}.{Guid.NewGuid():N}.tmp");
 
         try
         {
+            Directory.CreateDirectory(directory);
             using (var stream = new FileStream(
                 temporaryPath,
                 FileMode.CreateNew,

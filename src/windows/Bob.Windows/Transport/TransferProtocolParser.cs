@@ -131,6 +131,16 @@ internal static class TransferProtocolParser
             retryableValue.GetBoolean());
     }
 
+    public static Guid ParseCancel(JsonElement payload)
+    {
+        var transferId = RequiredGuid(payload, "transferId");
+        _ = RequiredString(payload, "reason");
+        return transferId;
+    }
+
+    public static TransferCanceled ParseCanceled(JsonElement payload) => new(
+        RequiredGuid(payload, "transferId"), RequiredUtcInstant(payload, "canceledAt"));
+
     public static (Guid TransferId, long Bytes, long? Total) ParseProgress(JsonElement payload)
     {
         var transferId = RequiredGuid(payload, "transferId");
@@ -237,6 +247,7 @@ internal static class TransferProtocolParser
         Guid transferId)
     {
         if (!payload.TryGetProperty(propertyName, out var value)
+            || value.ValueKind != JsonValueKind.Number
             || !value.TryGetInt64(out var result)
             || result < 0)
         {
@@ -266,7 +277,7 @@ internal static class TransferProtocolParser
             return null;
         }
 
-        if (value.TryGetInt64(out var result) && result >= 0)
+        if (value.ValueKind == JsonValueKind.Number && value.TryGetInt64(out var result) && result >= 0)
         {
             return result;
         }

@@ -6,7 +6,7 @@
 
 ## 当前目标
 
-P0/P1 已进入联调，在线 P2/P3 tracer 已落地。双端工程、Windows HTTPS/WSS 与 mDNS、Android 14 真机 NSD/TOFU/strict pin、WSS 文字，以及双方都在线时的图片/文件 PUT/GET 正文流已经建立。下一步优先完成双向正文矩阵，再补持久队列、后台传输及恢复语义。
+P0/P1 已进入联调，在线 P2/P3 tracer 已落地。双端工程、Windows HTTPS/WSS 与 mDNS、Android 14 真机 NSD/TOFU/strict pin、WSS 文字，以及图片/文件 PUT/GET 正文流已经建立。2026-10-06 已集成聊天式 UI、大文件限制解除、持久队列、断线摘要/终态协调、取消重试与 Android 活动传输后台服务。2026-10-07 本轮优化已收尾：Android 14 真机完成实际 Wi-Fi 双向 2 GiB + 17 字节、完整 SHA-256、锁屏与 MediaStore/日志恢复；输入、手动恢复、取消、TLS 清理、选择器断线返回与显式发现目标前台恢复已修复并复测。最终手机已同签名覆盖安装，Windows Release 和根启动器已更新并启动，详见 [真机验收补充](device-validation-2026-10-07.md)。
 
 ## 规范入口
 
@@ -23,28 +23,36 @@ P0/P1 已进入联调，在线 P2/P3 tracer 已落地。双端工程、Windows H
 ## 构建与检查
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\build.ps1
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\check.ps1
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-windows.ps1
+pwsh.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\build.ps1
+pwsh.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\check.ps1
+pwsh.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-windows.ps1
 ```
 
 上述命令使用 `.tools/` 中的固定工具链。命令是否在当前提交上通过，必须由执行者实际运行后报告；文档本身不代表已验证。
 
 ## 当前切片边界
 
-- Windows 已实现全英文 WPF GUI、共享像素手形图标、`GET /bob/v1/info`、`bob.v1` WSS 握手、空快照、单活动会话、心跳超时和文字收发；文字正文与状态原子持久化，主界面启动时恢复最近 20 条并自动滚到最新。原生 Windows DNS-SD 广播 `_bob._tcp.local`。仓库根目录可生成无控制台的 `BOB.exe` 快捷入口，应用用命名 Mutex 阻止并发实例。状态框明确显示服务就绪、等待 hello、已连接手机名和最近断开/协议失败原因。
+- Windows 已实现全英文 WPF GUI、共享像素手形图标、`GET /bob/v1/info`、`bob.v1` WSS 握手、分页传输快照、单活动会话、心跳超时和文字收发；文字正文与状态原子持久化，主界面启动时恢复最近 20 条并自动滚到最新。原生 Windows DNS-SD 广播 `_bob._tcp.local`。仓库根目录可生成无控制台的 `BOB.exe` 快捷入口，应用用命名 Mutex 阻止并发实例。状态框明确显示服务就绪、等待 hello、已连接手机名和最近断开/协议失败原因。
 - Android 已实现 Android 14 起的全英文 Compose GUI、共享 adaptive/legacy 像素手形图标、`NsdManager` 发现、延迟自动连接、多机选择与手动 IP。发现会保留全部 A/AAAA，优先同链路地址并顺序尝试，避免多网卡 Windows 的首地址误选。
 - Android 已实现 `/info` 同连接证书观察、受限 TOFU、应用私有完整 DER pin、全新 strict TLS 复核、`bob.v1` WSS hello/welcome/snapshot、双向文字与 ack。只有完整 snapshot 后才显示已连接；连接失败提示保留候选地址、WSS 升级 HTTP 状态和安全分类后的网络/TLS/WSS 原因，不显示正文或文件路径。
 - Android 文字使用原子 JSON 存储：出站先落盘、单一串行 drain、断线沿用原 `textId`；入站落盘后才 ack，并在重连时重发幂等 ack。信任变化绝不覆盖，只有确认 pin 冲突才开放“重置信任”。
 - 双端已实现当前前台在线会话内的图片/文件多选、每方向 FIFO、HTTPS 流式 PUT/GET、增量 SHA-256、progress、digest、completed 与 terminalAck。Windows 接收先写 `Downloads\BOB\.bob-<id>.part` 并禁止覆盖发布；Android 接收先写 MediaStore `IS_PENDING=1`，验证后发布到 `Pictures/BOB` 或 `Download/BOB`。
 - 双端文字卡片提供完整正文复制，图片卡片提供原图复制与显式查看；Android 通过原始 `content://` URI 写入系统剪贴板，Windows 复制完整解码图像。Android 接收图片只在 MediaStore 发布后开放操作，Windows 接收图片只在摘要验证与原子发布后开放最终路径，不读取 pending 内容或 `.part`。Windows 大图由应用内有界解码器显示，不把图片路径交给系统 shell；解码失败时不开放查看或复制操作。
 - Windows 主界面允许选择并打开统一收件目录；新目录通过临时探针验证可创建、写入和删除后，选择才持久化到 `%LocalAppData%\BOB\settings.json`。活动接收在 accepted 时冻结原收件根，目录变更只影响后续 offer，保证 staging 与最终发布仍在同一目录。
-- 文件队列与终态目前仅在进程内；Android 系统分享入口、前台传输服务、锁屏、离线/重启恢复、取消/重试、Windows 拖放与传输历史持久化尚未实现。Android 进入后台后当前仍会延迟断开，因此本切片只承诺双方在线且 Android 前台。
-- Windows 托盘生命周期尚未实现；当前关闭主窗口会退出 BOB 并停止网络服务，不得把它误报为规格中的“隐藏到托盘”。
+- 2026-10-06 文件队列与协调改为原子日志：Windows 待发源路径/元数据跨重启恢复；正文中断从头重试，verifying 与未确认终态沿用原 ID 重放；双端提供取消/新 ID 重试。Android 临时 URI 在进程退出后仍需重新选择，系统分享入口尚未实现。原生 dataSync 服务维持活动传输，闲时后台断开；Android 14 已验证已有传输锁屏继续，Android 15+ 的后台累计预算见主规格。
+- Windows 已实现原生托盘生命周期：关闭主窗口隐藏；双击托盘或 Open BOB 恢复窗口；Exit BOB 才停止网络服务。Windows 接收正文解除 Kestrel 默认大小/最低速率限制，双端正文停滞期限 60 秒，摘要协调仍为 24 小时。
 - Windows 已从持久文字历史恢复入站 `textId` 去重：同 ID、同正文与 `createdAt` 只重发 ack，不重复加入时间线；同 ID、不可变字段冲突时返回 `invalid_metadata`。
-- 双端主界面均只加载当前对端最近 20 条文字作为可见上下文，但不会删除更早的本地记录。Windows 隐藏去重 tombstone 与待确认出站文字的自动重放仍未完整实现，因此重启后的端到端离线重放尚未达到 P1 退出门槛。
+- 双端主界面展示最近 20 条文字窗口和文件历史，统一显示为接收左/发送右的聊天气泡，配色不变；连接设置移到独立面板，翻阅旧记录时不强制滚动。Windows 已持久化待确认文字并在末页 snapshot 后重放原 textId；隐藏 tombstone、清空历史与完整发布验收仍待后续。
 
-## 已执行验证
+## 2026-10-07 真机与收尾验证
+
+根目录全量 build/check 通过，最后 Windows 与 Android 补丁分别重跑对应 Target：Windows 45 项、Android 17 组与 lint 通过。最终同签名 APK 覆盖安装，原生真机检查 12/12；显式选择发现电脑后，Home 与返回前台连续两轮恢复 Connected。Windows 最新 Release/根 `BOB.exe` 使用原用户资料运行。真机双向 2 GiB + 17 字节、完整摘要、锁屏、取消与新 ID 重试、选择器内断线返回等执行范围及未验证项见 [真机验收记录](device-validation-2026-10-07.md)。
+
+## 2026-10-06 优化验证
+
+本轮根目录全量 build/check 通过：Windows 43 项、Android 15 组流式/规则检查与 lint；最新 Debug APK 和 Windows Release/根启动器已生成。UI 渲染与托盘生命周期检查通过，未连接手机。本轮详细修改与验证边界见 [优化交付记录](optimization-2026-10-06.md)。以下为此前切片的历史验证，不代表 2026-10-06 当前改动已通过。
+
+## 历史验证
 
 - Windows Debug 构建：通过，0 警告、0 错误。
 - Windows 检查程序：20 项通过；除原有协议/会话/证书检查外，覆盖真实 Kestrel WebSocket 的 `AwaitingHello → Connected（含手机名）→ Offline（含断开原因）`、文字、结构化 PUT 错误、零字节/普通文件、SHA-256、路径约束、同名不覆盖、完整上传控制面、accepted/GET 跨通道竞态与下载终态闭环，以及文字历史持久化/最近 20 条窗口/跨重启去重、文字与图片复制动作、收件目录持久化/损坏回退、活动传输目录冻结、有界图片预览、非图片伪装拒绝和旧 transfer snapshot 丢弃。
