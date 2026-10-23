@@ -15,7 +15,7 @@ using Microsoft.AspNetCore.Server.Kestrel.Core;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 
-internal static class RealTransportChecks
+internal static partial class RealTransportChecks
 {
     public static async Task CheckTextRoundTripAsync()
     {

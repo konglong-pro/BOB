@@ -76,6 +76,7 @@ public partial class App : Application
             builder.Services.AddSingleton<TextHistoryStore>();
             builder.Services.AddSingleton<SessionCoordinator>();
             builder.Services.AddSingleton<ReceiveDirectorySettings>();
+            builder.Services.AddSingleton<ClipboardImageStore>();
             builder.Services.AddSingleton<TransferCoordinator>();
             builder.Services.AddSingleton<WebSocketSessionHandler>();
             builder.Services.AddSingleton<MainWindowViewModel>();

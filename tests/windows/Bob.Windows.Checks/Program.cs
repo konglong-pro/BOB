@@ -27,6 +27,24 @@ var checks = new (string Name, Action Run)[]
     ("image timeline exposes an explicit local preview", CheckImageTimelinePreview),
     ("stale transfer snapshots cannot replace completed state", CheckTransferSnapshotRevisionRace),
     ("bounded WebSocket close", CheckBoundedWebSocketClose),
+    ("clipboard image cache preserves PNG pixels and cleans up", () =>
+        RealTransportChecks.CheckClipboardImageCacheAsync().GetAwaiter().GetResult()),
+    ("direct content input requires a connected phone", () =>
+        RealTransportChecks.CheckContentInputOfflineAsync().GetAwaiter().GetResult()),
+    ("dropped content skips invalid items and sends in FIFO order", () =>
+        RealTransportChecks.CheckDroppedContentFifoAsync().GetAwaiter().GetResult()),
+    ("pasted image is immediately offered and streamed as PNG", () =>
+        RealTransportChecks.CheckClipboardImageDownloadAsync().GetAwaiter().GetResult()),
+    ("window file drop sends content without inserting paths into text", () =>
+        RealTransportChecks.CheckWindowFileDropAsync().GetAwaiter().GetResult()),
+    ("clipboard image formats preserve pixels and prefer original files", () =>
+        RealTransportChecks.CheckClipboardImageFormatsAsync().GetAwaiter().GetResult()),
+    ("copied image files paste once with original bytes and FIFO order", () =>
+        RealTransportChecks.CheckCopiedImageFilesPasteAsync().GetAwaiter().GetResult()),
+    ("PNG clipboard paste uses the image command and completes its body transfer", () =>
+        RealTransportChecks.CheckPngClipboardPasteAsync().GetAwaiter().GetResult()),
+    ("image paste routing leaves ordinary text and non-image formats unhandled", () =>
+        RealTransportChecks.CheckTextClipboardRoutingAsync().GetAwaiter().GetResult()),
     ("real WebSocket text round-trip", () =>
         RealTransportChecks.CheckTextRoundTripAsync().GetAwaiter().GetResult()),
     ("unknown upload is rejected by the transfer endpoint", () =>
