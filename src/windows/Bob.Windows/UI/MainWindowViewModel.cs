@@ -6,6 +6,7 @@ using System.Runtime.InteropServices;
 using System.Text;
 using System.Windows;
 using System.Windows.Media;
+using System.Windows.Media.Imaging;
 using System.Windows.Input;
 using Bob.Windows.Domain;
 using Bob.Windows.Persistence;
@@ -25,6 +26,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged
     private readonly TransferCoordinator _transfers;
     private readonly ReceiveDirectorySettings _receiveDirectorySettings;
     private readonly TextHistoryStore _textHistory;
+    private readonly ClipboardImageStore _clipboardImages;
     private readonly AsyncRelayCommand _sendTextCommand;
     private readonly AsyncRelayCommand _chooseImageCommand;
     private readonly AsyncRelayCommand _chooseFileCommand;
@@ -47,12 +49,14 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged
         TransferCoordinator transfers,
         ReceiveDirectorySettings receiveDirectorySettings,
         TextHistoryStore textHistory,
-        ServerIdentity identity)
+        ServerIdentity identity,
+        ClipboardImageStore clipboardImages)
     {
         _sessions = sessions;
         _transfers = transfers;
         _receiveDirectorySettings = receiveDirectorySettings;
         _textHistory = textHistory;
+        _clipboardImages = clipboardImages;
         ServerDetails = $"HTTPS :{BobProtocol.DefaultPort} · {identity.CertificatePin[..10]}…";
         _sendTextCommand = new AsyncRelayCommand(SendTextAsync, CanSendText);
         _chooseImageCommand = new AsyncRelayCommand(ChooseImagesAsync, CanChooseFiles);
@@ -80,6 +84,8 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged
     public ObservableCollection<TimelineItemViewModel> Timeline { get; } = new();
 
     public string ServerDetails { get; }
+
+    public bool CanSendContent => _sessions.Snapshot.IsConnected;
 
     public ICommand SendTextCommand => _sendTextCommand;
 
@@ -156,7 +162,48 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged
         && !string.IsNullOrWhiteSpace(DraftText)
         && Encoding.UTF8.GetByteCount(DraftText) <= BobProtocol.MaxTextBytes;
 
-    private bool CanChooseFiles() => _sessions.Snapshot.IsConnected;
+    private bool CanChooseFiles() => CanSendContent;
+
+    public void ShowContentInputError(string message) => ComposerHint = message;
+
+    public async Task SendDroppedFilesAsync(IEnumerable<string> paths)
+    {
+        await QueueFilesAsync(paths);
+    }
+
+    public async Task SendClipboardImageAsync(BitmapSource image)
+    {
+        if (!CanSendContent)
+        {
+            ComposerHint = "Connect a phone before sending images or files.";
+            return;
+        }
+
+        string? path = null;
+        var queued = false;
+        try
+        {
+            path = await _clipboardImages.SaveAsync(image);
+            queued = await QueueFilesAsync([path], TransferKind.Image) > 0;
+        }
+        catch (Exception exception) when (
+            exception is IOException
+                or UnauthorizedAccessException
+                or ArgumentException
+                or InvalidOperationException
+                or NotSupportedException
+                or COMException)
+        {
+            ComposerHint = "BOB could not prepare the clipboard image. Try again.";
+        }
+        finally
+        {
+            if (path is not null && !queued)
+            {
+                _clipboardImages.Delete(path);
+            }
+        }
+    }
 
     private Task ChooseReceiveDirectoryAsync()
     {
@@ -233,26 +280,60 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged
             return;
         }
 
+        await QueueFilesAsync(dialog.FileNames, kind);
+    }
+
+    private async Task<int> QueueFilesAsync(IEnumerable<string> paths, TransferKind? selectedKind = null)
+    {
+        if (!CanSendContent)
+        {
+            ComposerHint = "Connect a phone before sending images or files.";
+            return 0;
+        }
+
         var queued = 0;
-        foreach (var path in dialog.FileNames)
+        var folders = 0;
+        var unavailable = 0;
+        foreach (var path in paths)
         {
             try
             {
+                if (Directory.Exists(path))
+                {
+                    folders++;
+                    continue;
+                }
+
+                var kind = selectedKind ?? (TransferFileNames.GuessMediaType(path, TransferKind.File)
+                    .StartsWith("image/", StringComparison.Ordinal)
+                        ? TransferKind.Image
+                        : TransferKind.File);
                 _transfers.EnqueueOutgoing(path, kind);
                 queued++;
             }
             catch (Exception exception) when (
                 exception is IOException
                     or UnauthorizedAccessException
-                    or ArgumentException)
+                    or ArgumentException
+                    or NotSupportedException)
             {
-                ComposerHint = $"Could not queue {Path.GetFileName(path)}.";
+                unavailable++;
             }
+        }
+
+        ComposerHint = queued > 0 ? $"Queued {queued} item(s) to send." : "No files were queued.";
+        if (folders > 0)
+        {
+            ComposerHint += " Folders are not supported in v1. Compress them to ZIP first.";
+        }
+        if (unavailable > 0)
+        {
+            ComposerHint += $" Could not read {unavailable} file(s).";
         }
 
         if (queued == 0)
         {
-            return;
+            return 0;
         }
 
         try
@@ -266,6 +347,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged
         {
             ComposerHint = "Could not offer the selected content. Check the connection.";
         }
+        return queued;
     }
 
     private async Task SendTextAsync()
@@ -358,6 +440,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged
         }
 
         _sendTextCommand.RaiseCanExecuteChanged();
+        OnPropertyChanged(nameof(CanSendContent));
         _chooseImageCommand.RaiseCanExecuteChanged();
         _chooseFileCommand.RaiseCanExecuteChanged();
     }

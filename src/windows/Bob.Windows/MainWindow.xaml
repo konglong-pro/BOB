@@ -7,8 +7,12 @@
         Height="760"
         MinWidth="760"
         MinHeight="600"
-        WindowStartupLocation="CenterScreen">
-    <Grid Margin="40,32,40,32">
+        WindowStartupLocation="CenterScreen"
+        AllowDrop="True"
+        PreviewDragOver="OnPreviewDragOver"
+        PreviewDragLeave="OnPreviewDragLeave"
+        PreviewDrop="OnPreviewDrop">
+    <Grid Margin="40,32,40,32" Background="Transparent">
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto" />
             <RowDefinition Height="Auto" />
@@ -134,7 +138,7 @@
                                HorizontalAlignment="Center"
                                FontSize="28"
                                FontWeight="Bold" />
-                    <TextBlock Text="Text, images, and files appear here once your phone connects."
+                    <TextBlock Text="Connect your phone, then drop files here or paste an image."
                                Margin="0,8,0,0"
                                Foreground="{StaticResource MutedBrush}"
                                FontSize="15" />
@@ -250,7 +254,8 @@
                 <RowDefinition Height="Auto" />
             </Grid.RowDefinitions>
 
-            <TextBox Text="{Binding DraftText, UpdateSourceTrigger=PropertyChanged}"
+            <TextBox x:Name="ComposerTextBox"
+                     Text="{Binding DraftText, UpdateSourceTrigger=PropertyChanged}"
                      MinHeight="72"
                      MaxHeight="160"
                      AcceptsReturn="True"
@@ -259,7 +264,12 @@
                      ToolTip="Enter text to send to your phone" />
 
             <Grid Grid.Row="1" Margin="0,10,0,0">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                </Grid.RowDefinitions>
                 <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto" />
                     <ColumnDefinition Width="Auto" />
                     <ColumnDefinition Width="Auto" />
                     <ColumnDefinition Width="*" />
@@ -274,17 +284,43 @@
                         Content="Choose File"
                         Command="{Binding ChooseFileCommand}"
                         ToolTip="Choose one or more files to send." />
-                <TextBlock Grid.Column="2"
-                           Margin="14,0"
+                <Button Grid.Column="2"
+                        Margin="8,0,0,0"
+                        Content="Paste Image"
+                        IsEnabled="{Binding CanSendContent}"
+                        Click="OnPasteImageClick"
+                        ToolTip="Paste and send a clipboard image immediately (Ctrl+V)." />
+                <TextBlock Grid.Row="1"
+                           Grid.ColumnSpan="5"
+                           Margin="0,8,0,0"
                            VerticalAlignment="Center"
                            Text="{Binding ComposerHint}"
+                           TextWrapping="Wrap"
                            Foreground="{StaticResource MutedBrush}"
                            FontSize="12" />
-                <Button Grid.Column="3"
+                <Button Grid.Column="4"
                         MinWidth="96"
                         Content="Send Text"
                         Command="{Binding SendTextCommand}" />
             </Grid>
         </Grid>
+
+        <Border x:Name="DropOverlay"
+                Grid.RowSpan="4"
+                Padding="24"
+                Background="{StaticResource SurfaceBrush}"
+                BorderBrush="{StaticResource StrokeBrush}"
+                BorderThickness="3"
+                IsHitTestVisible="False"
+                Visibility="Collapsed">
+            <TextBlock x:Name="DropHint"
+                       Text="Release to send files"
+                       HorizontalAlignment="Center"
+                       VerticalAlignment="Center"
+                       TextAlignment="Center"
+                       TextWrapping="Wrap"
+                       FontSize="28"
+                       FontWeight="Bold" />
+        </Border>
     </Grid>
 </Window>
