@@ -67,7 +67,9 @@ public sealed record TransferSnapshot(
     string? StoredName,
     string? ErrorCode,
     string? ErrorMessage,
-    string? LocalPath);
+    string? LocalPath,
+    DateTimeOffset RecordedAt = default,
+    string PeerName = "phone");
 
 public enum IncomingOfferReply
 {

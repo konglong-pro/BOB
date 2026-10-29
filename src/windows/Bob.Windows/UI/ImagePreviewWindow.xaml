@@ -1,7 +1,7 @@
 <Window x:Class="Bob.Windows.UI.ImagePreviewWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="BOB · Image preview"
+        Title="BOB · Image preview" Style="{StaticResource {x:Type Window}}"
         Width="920"
         Height="720"
         MinWidth="520"

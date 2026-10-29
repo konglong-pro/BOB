@@ -1,4 +1,5 @@
 using Bob.Windows.Domain;
+using Bob.Windows.Persistence;
 using Bob.Windows.Storage;
 using System.Net.Http.Headers;
 
@@ -12,6 +13,8 @@ public sealed class TransferCoordinator
     private readonly Queue<Guid> _outgoingQueue = new();
     private readonly ReceiveDirectorySettings? _receiveDirectorySettings;
     private readonly string? _fixedReceiveDirectory;
+    private readonly TransferHistoryStore? _history;
+    private readonly SessionCoordinator? _sessions;
 
     public TransferCoordinator()
         : this(ReceiveDirectorySettings.GetDefaultReceiveDirectory())
@@ -24,6 +27,18 @@ public sealed class TransferCoordinator
         _receiveDirectorySettings = receiveDirectorySettings;
     }
 
+    public TransferCoordinator(
+        ReceiveDirectorySettings receiveDirectorySettings,
+        TransferHistoryStore history,
+        SessionCoordinator sessions)
+        : this(receiveDirectorySettings)
+    {
+        ArgumentNullException.ThrowIfNull(history);
+        ArgumentNullException.ThrowIfNull(sessions);
+        _history = history;
+        _sessions = sessions;
+    }
+
     public TransferCoordinator(string receiveDirectory)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(receiveDirectory);
@@ -31,6 +46,24 @@ public sealed class TransferCoordinator
     }
 
     public event EventHandler<TransferSnapshot>? TransferChanged;
+
+    public event EventHandler<string>? HistoryPersistenceFailed;
+
+    public string? HistoryWarning => _history?.ReadWarning;
+
+    public IReadOnlyList<TransferSnapshot> ReadHistory()
+    {
+        lock (_sync)
+        {
+            var snapshots = (_history?.ReadAll() ?? []).ToDictionary(item => item.TransferId);
+            foreach (var entry in _entries.Values)
+            {
+                snapshots[entry.Offer.TransferId] = CreateSnapshot(entry, advanceRevision: false);
+            }
+
+            return snapshots.Values.OrderBy(item => item.RecordedAt).ThenBy(item => item.TransferId).ToArray();
+        }
+    }
 
     public string ReceiveDirectory => GetCurrentReceiveDirectory();
 
@@ -843,10 +876,10 @@ public sealed class TransferCoordinator
         }
     }
 
-    private static TransferEntry CreateEntry(
+    private TransferEntry CreateEntry(
         TransferOffer offer,
         TransferDirection direction) =>
-        new(offer, direction);
+        new(offer, direction, _sessions?.Snapshot.PeerName ?? "phone");
 
     private TransferEntry GetEntryLocked(Guid transferId)
     {
@@ -912,10 +945,10 @@ public sealed class TransferCoordinator
         return failure;
     }
 
-    private static TransferSnapshot CreateSnapshot(TransferEntry entry) =>
+    private static TransferSnapshot CreateSnapshot(TransferEntry entry, bool advanceRevision = true) =>
         new(
             entry.Offer.TransferId,
-            ++entry.Revision,
+            advanceRevision ? ++entry.Revision : entry.Revision,
             entry.Direction,
             entry.Offer.Kind,
             entry.Offer.Name,
@@ -928,7 +961,9 @@ public sealed class TransferCoordinator
             entry.StoredName,
             entry.Failure?.Code,
             entry.Failure?.Message,
-            GetLocalPath(entry));
+            GetLocalPath(entry),
+            entry.RecordedAt,
+            entry.PeerName);
 
     private static string? GetLocalPath(TransferEntry entry)
     {
@@ -956,6 +991,15 @@ public sealed class TransferCoordinator
     {
         if (snapshot is not null)
         {
+            try
+            {
+                _history?.Save(snapshot);
+            }
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+            {
+                HistoryPersistenceFailed?.Invoke(this, "This transfer changed state, but its history could not be saved.");
+            }
+
             TransferChanged?.Invoke(this, snapshot);
         }
     }
@@ -991,15 +1035,20 @@ public sealed class TransferCoordinator
 
     private sealed class TransferEntry
     {
-        public TransferEntry(TransferOffer offer, TransferDirection direction)
+        public TransferEntry(TransferOffer offer, TransferDirection direction, string peerName)
         {
             Offer = offer;
             Direction = direction;
+            PeerName = peerName;
         }
 
         public TransferOffer Offer { get; }
 
         public TransferDirection Direction { get; }
+
+        public DateTimeOffset RecordedAt { get; } = DateTimeOffset.UtcNow;
+
+        public string PeerName { get; }
 
         public TransferState State { get; set; } = TransferState.Queued;
 

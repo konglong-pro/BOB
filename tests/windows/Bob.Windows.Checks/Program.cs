@@ -12,6 +12,12 @@ using Bob.Windows.Storage;
 using Bob.Windows.Transport;
 using Bob.Windows.UI;
 
+if (args.SequenceEqual(new[] { "--desktop-lifetime-check" }))
+{
+    try { DesktopLifetimeChecks.Check(); return 0; }
+    catch (Exception exception) { Console.Error.WriteLine(exception); return 1; }
+}
+
 var checks = new (string Name, Action Run)[]
 {
     ("protocol JSON shape", CheckProtocolJson),
@@ -23,6 +29,10 @@ var checks = new (string Name, Action Run)[]
     ("reserved transfer filenames", CheckReservedTransferFilenames),
     ("receive directory setting persists", CheckReceiveDirectorySettingPersists),
     ("text history persists and exposes the latest 20 messages", CheckTextHistoryPersistence),
+    ("transfer archive survives restart without exposing unverified content", TransferHistoryChecks.CheckRestart),
+    ("transfer archive preserves older category records and rejects stale updates", TransferHistoryChecks.CheckArchive),
+    ("transfer archive failure leaves live transfer usable and reports the problem", TransferHistoryChecks.CheckPersistenceFailure),
+    ("desktop category history, pagination, selection and shortcut behavior", DesktopInteractionChecks.Check),
     ("active incoming transfer freezes its receive directory", CheckFrozenReceiveDirectory),
     ("image timeline exposes an explicit local preview", CheckImageTimelinePreview),
     ("stale transfer snapshots cannot replace completed state", CheckTransferSnapshotRevisionRace),
@@ -40,7 +50,8 @@ var checks = new (string Name, Action Run)[]
     ("WebSocket and HTTP complete an upload protocol round-trip", () =>
         RealTransportChecks.CheckWebSocketUploadRoundTripAsync().GetAwaiter().GetResult()),
     ("download is state-gated and completes across WebSocket and HTTP", () =>
-        RealTransportChecks.CheckWebSocketDownloadRoundTripAsync().GetAwaiter().GetResult())
+        RealTransportChecks.CheckWebSocketDownloadRoundTripAsync().GetAwaiter().GetResult()),
+    ("native desktop lifetime registers shortcuts, hides, restores and releases resources", DesktopLifetimeChecks.CheckInIsolatedProcess)
 };
 
 var failures = 0;

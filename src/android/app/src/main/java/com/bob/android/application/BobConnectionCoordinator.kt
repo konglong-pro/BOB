@@ -104,6 +104,7 @@ class BobConnectionCoordinator(
     val state: StateFlow<BobConnectionState> = mutableState.asStateFlow()
     private val transferCoordinator = OnlineTransferCoordinator(applicationContext, scope)
     val transferItems = transferCoordinator.items
+    val transferHistoryWarning = transferCoordinator.historyWarning
 
     private var generation = 0L
     private var connectionJob: Job? = null

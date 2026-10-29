@@ -29,6 +29,7 @@ data class TextTimelineItemUi(
     val statusLabel: String,
     val timeLabel: String,
     val isOutgoing: Boolean,
+    val recordedAtMillis: Long,
 )
 
 data class TransferTimelineItemUi(
@@ -40,6 +41,11 @@ data class TransferTimelineItemUi(
     val progressLabel: String,
     val previewUri: String?,
     val errorMessage: String?,
+    val isOutgoing: Boolean,
+    val recordedAtMillis: Long,
+    val timeLabel: String,
+    val contentUri: String?,
+    val mediaType: String,
 )
 
 data class BobUiState(
@@ -64,4 +70,5 @@ data class BobUiState(
     val isQueueingText: Boolean = false,
     val timeline: List<TextTimelineItemUi> = emptyList(),
     val transfers: List<TransferTimelineItemUi> = emptyList(),
+    val historyWarning: String? = null,
 )

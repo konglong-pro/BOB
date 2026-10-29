@@ -12,18 +12,23 @@ namespace Bob.Windows.UI;
 public sealed class TimelineItemViewModel : INotifyPropertyChanged
 {
     private const int ThumbnailMaxDimension = 360;
+    private static readonly SemaphoreSlim ThumbnailDecoders = new(2);
     private string _status;
     private string? _detail;
     private readonly TransferKind? _kind;
     private readonly Action<string>? _openImage;
     private readonly Action<string>? _copyText;
     private readonly Action<string>? _copyImage;
+    private readonly Action<string>? _openFile;
     private readonly RelayCommand _viewImageCommand;
     private readonly RelayCommand _copyTextCommand;
     private readonly RelayCommand _copyImageCommand;
+    private readonly RelayCommand _openFileCommand;
     private string? _localPath;
     private ImageSource? _thumbnail;
     private long _thumbnailRevision;
+    private bool _isExpanded;
+    private bool _thumbnailEnabled;
 
     public TimelineItemViewModel(
         Guid textId,
@@ -37,11 +42,15 @@ public sealed class TimelineItemViewModel : INotifyPropertyChanged
         string? localPath = null,
         Action<string>? openImage = null,
         Action<string>? copyText = null,
-        Action<string>? copyImage = null)
+        Action<string>? copyImage = null,
+        DateTimeOffset? recordedAt = null,
+        bool loadThumbnail = true,
+        Action<string>? openFile = null)
     {
         TextId = textId;
         Text = text;
         CreatedAt = createdAt;
+        RecordedAt = recordedAt ?? createdAt;
         Outgoing = outgoing;
         _status = status;
         _detail = detail;
@@ -49,9 +58,13 @@ public sealed class TimelineItemViewModel : INotifyPropertyChanged
         _openImage = openImage;
         _copyText = copyText;
         _copyImage = copyImage;
+        _openFile = openFile;
         _viewImageCommand = new RelayCommand(ViewImage, CanViewImage);
         _copyTextCommand = new RelayCommand(CopyText, CanCopyText);
         _copyImageCommand = new RelayCommand(CopyImage, CanCopyImage);
+        _openFileCommand = new RelayCommand(() => _openFile!(LocalPath!),
+            () => _kind == TransferKind.File && _openFile is not null && File.Exists(LocalPath));
+        _thumbnailEnabled = loadThumbnail;
         PeerName = peerName;
         LocalPath = localPath;
     }
@@ -63,6 +76,51 @@ public sealed class TimelineItemViewModel : INotifyPropertyChanged
     public string Text { get; }
 
     public DateTimeOffset CreatedAt { get; }
+
+    public DateTimeOffset RecordedAt { get; }
+
+    public string Category => _kind switch
+    {
+        TransferKind.Image => "Images",
+        TransferKind.File => "Files",
+        _ => "Text"
+    };
+
+    public Visibility TextVisibility => IsText ? Visibility.Visible : Visibility.Collapsed;
+
+    public Visibility AttachmentVisibility => IsText ? Visibility.Collapsed : Visibility.Visible;
+
+    public Visibility FileVisibility => _kind == TransferKind.File ? Visibility.Visible : Visibility.Collapsed;
+
+    public Visibility ImageNameVisibility => _kind == TransferKind.Image ? Visibility.Visible : Visibility.Collapsed;
+
+    public bool HasLongText => IsText && Text.Length > 1200;
+
+    public Visibility ExpandVisibility => HasLongText ? Visibility.Visible : Visibility.Collapsed;
+
+    public bool IsExpanded
+    {
+        get => _isExpanded;
+        set
+        {
+            _isExpanded = value;
+            OnPropertyChanged();
+            OnPropertyChanged(nameof(DisplayedText));
+        }
+    }
+
+    public string DisplayedText
+    {
+        get
+        {
+            if (!HasLongText || IsExpanded) return Text;
+            var end = char.IsHighSurrogate(Text[1199]) ? 1199 : 1200;
+            return Text[..end] + "…";
+        }
+    }
+
+    public Brush BubbleBrush => (Brush)Application.Current.FindResource(
+        Outgoing ? "ButtonBrush" : "SurfaceBrush");
 
     public bool Outgoing { get; }
 
@@ -80,6 +138,8 @@ public sealed class TimelineItemViewModel : INotifyPropertyChanged
     public ICommand CopyTextCommand => _copyTextCommand;
 
     public ICommand CopyImageCommand => _copyImageCommand;
+
+    public ICommand OpenFileCommand => _openFileCommand;
 
     public bool IsText => _kind is null;
 
@@ -132,7 +192,7 @@ public sealed class TimelineItemViewModel : INotifyPropertyChanged
             _localPath = value;
             var revision = Interlocked.Increment(ref _thumbnailRevision);
             Thumbnail = null;
-            ThumbnailLoadTask = _kind == TransferKind.Image
+            ThumbnailLoadTask = _thumbnailEnabled && _kind == TransferKind.Image
                 && !string.IsNullOrWhiteSpace(value)
                 ? LoadThumbnailAsync(value, revision)
                 : Task.CompletedTask;
@@ -141,6 +201,7 @@ public sealed class TimelineItemViewModel : INotifyPropertyChanged
             OnPropertyChanged(nameof(CopyImageVisibility));
             _viewImageCommand.RaiseCanExecuteChanged();
             _copyImageCommand.RaiseCanExecuteChanged();
+            _openFileCommand.RaiseCanExecuteChanged();
         }
     }
 
@@ -221,11 +282,26 @@ public sealed class TimelineItemViewModel : INotifyPropertyChanged
         }
     }
 
+    internal void SetThumbnailEnabled(bool enabled)
+    {
+        if (_thumbnailEnabled == enabled) return;
+        _thumbnailEnabled = enabled;
+        var revision = Interlocked.Increment(ref _thumbnailRevision);
+        Thumbnail = null;
+        ThumbnailLoadTask = enabled && _kind == TransferKind.Image && !string.IsNullOrWhiteSpace(_localPath)
+            ? LoadThumbnailAsync(_localPath, revision) : Task.CompletedTask;
+    }
+
     private async Task LoadThumbnailAsync(string path, long revision)
     {
-        var thumbnail = await Task.Run(
-                () => LoadImagePreview(path, ThumbnailMaxDimension))
-            .ConfigureAwait(false);
+        await ThumbnailDecoders.WaitAsync().ConfigureAwait(false);
+        ImageSource? thumbnail;
+        try
+        {
+            if (revision != Volatile.Read(ref _thumbnailRevision)) return;
+            thumbnail = await Task.Run(() => LoadImagePreview(path, ThumbnailMaxDimension)).ConfigureAwait(false);
+        }
+        finally { ThumbnailDecoders.Release(); }
 
         void ApplyThumbnail()
         {
