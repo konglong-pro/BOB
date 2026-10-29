@@ -3,11 +3,14 @@ package com.bob.android.ui
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.Intent
 import android.graphics.Bitmap
 import android.net.Uri
 import android.os.CancellationSignal
 import android.util.Size
 import android.widget.Toast
+import android.widget.ScrollView
+import android.widget.TextView
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
@@ -16,11 +19,13 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
@@ -36,6 +41,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.selection.selectableGroup
 import androidx.compose.foundation.verticalScroll
@@ -44,14 +50,20 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -72,6 +84,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.compose.LifecycleStartEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -84,6 +97,7 @@ import com.bob.android.ui.theme.BobSecondaryInk
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.launch
 
 @Composable
 fun BobApp(viewModel: BobViewModel = viewModel()) {
@@ -129,6 +143,17 @@ fun BobApp(viewModel: BobViewModel = viewModel()) {
     )
 }
 
+private enum class HistoryCategory(val label: String) {
+    Chat("Chat"), Text("Text"), Images("Images"), Files("Files"),
+}
+
+private data class ChatEntry(
+    val key: String,
+    val recordedAtMillis: Long,
+    val text: TextTimelineItemUi? = null,
+    val transfer: TransferTimelineItemUi? = null,
+)
+
 @Composable
 private fun BobScreen(
     state: BobUiState,
@@ -144,167 +169,132 @@ private fun BobScreen(
     onChooseImages: () -> Unit,
     onChooseFiles: () -> Unit,
 ) {
+    var category by rememberSaveable { mutableStateOf(HistoryCategory.Chat) }
+    var settingsExpanded by rememberSaveable { mutableStateOf(false) }
+    var visibleCount by rememberSaveable(category) { mutableStateOf(40) }
+    val listState = rememberLazyListState()
+    val scope = rememberCoroutineScope()
+    var followingLatest by remember { mutableStateOf(true) }
+    var previousLastKey by remember(category) { mutableStateOf<String?>(null) }
+    val entries = remember(state.timeline, state.transfers, category) {
+        buildList {
+            if (category == HistoryCategory.Chat || category == HistoryCategory.Text) {
+                state.timeline.forEach { add(ChatEntry("text:${it.key}", it.recordedAtMillis, text = it)) }
+            }
+            if (category != HistoryCategory.Text) {
+                state.transfers.filter {
+                    category == HistoryCategory.Chat ||
+                        (category == HistoryCategory.Images && it.kindLabel == "Image") ||
+                        (category == HistoryCategory.Files && it.kindLabel == "File")
+                }.forEach { add(ChatEntry("transfer:${it.key}", it.recordedAtMillis, transfer = it)) }
+            }
+        }.sortedWith(compareBy(ChatEntry::recordedAtMillis, ChatEntry::key))
+    }
+    val visibleEntries = entries.takeLast(visibleCount)
+    val hasEarlier = entries.size > visibleCount
+    LaunchedEffect(listState) {
+        snapshotFlow { !listState.canScrollForward }.collect { followingLatest = it }
+    }
+    LaunchedEffect(entries.lastOrNull()?.key, category) {
+        if (visibleEntries.isNotEmpty() && (previousLastKey == null || followingLatest)) {
+            listState.scrollToItem(visibleEntries.lastIndex + if (hasEarlier) 1 else 0)
+        }
+        previousLastKey = entries.lastOrNull()?.key
+    }
     Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(BobBackground)
-            .windowInsetsPadding(WindowInsets.safeDrawing)
-            .imePadding(),
+        modifier = Modifier.fillMaxSize().background(BobBackground)
+            .windowInsetsPadding(WindowInsets.safeDrawing).imePadding(),
     ) {
-        LazyColumn(
-            modifier = Modifier
-                .weight(1f)
-                .padding(horizontal = 24.dp, vertical = 20.dp),
-        ) {
-        item {
-            Header(discoveryLabel = state.discoveryLabel, active = state.isSearching)
-            if (state.connectionPhase != ConnectionUiPhase.Connected) {
-                Spacer(Modifier.height(40.dp))
-                Text(
-                    text = "Connect to your computer",
-                    color = BobInk,
-                    fontSize = 32.sp,
-                    lineHeight = 36.sp,
-                    fontWeight = FontWeight.Bold,
-                )
-                Spacer(Modifier.height(8.dp))
-                Text(
-                    text = "Your phone and Windows computer must be on the same Wi-Fi. The certificate pin is saved silently the first time.",
-                    color = BobSecondaryInk,
-                    fontSize = 16.sp,
-                    lineHeight = 24.sp,
-                )
-                Spacer(Modifier.height(24.dp))
-                DeviceSection(state, onSelectPeer, onRefresh)
-                Spacer(Modifier.height(18.dp))
-                ManualAddressSection(
-                    address = state.manualIp,
-                    onAddressChanged = onManualIpChanged,
-                    onUseAddress = onUseManualIp,
-                )
-            }
-            Spacer(Modifier.height(18.dp))
-            ConnectionSection(
-                state = state,
-                onConnect = onRequestConnection,
-                onDisconnect = onDisconnect,
-                onResetTrust = onResetTrust,
-            )
-            state.notice?.let { message ->
-                Spacer(Modifier.height(14.dp))
-                Notice(message)
-            }
-            if (state.transfers.isNotEmpty()) {
-                Spacer(Modifier.height(30.dp))
-                Text(
-                    text = "Transfers",
-                    color = BobInk,
-                    fontSize = 20.sp,
-                    fontWeight = FontWeight.Bold,
-                )
-                Spacer(Modifier.height(10.dp))
-            }
-        }
-
-        if (state.transfers.isNotEmpty()) {
-            items(state.transfers, key = TransferTimelineItemUi::key) { item ->
-                TransferCard(item)
-                Spacer(Modifier.height(10.dp))
-            }
-        }
-
-        item {
-            Spacer(Modifier.height(30.dp))
-            Text(
-                text = "Recent messages · latest 20",
-                color = BobInk,
-                fontSize = 20.sp,
-                fontWeight = FontWeight.Bold,
-            )
-            Spacer(Modifier.height(10.dp))
-        }
-
-        if (state.timeline.isEmpty()) {
-            item { EmptyTimeline(state.connectionPhase == ConnectionUiPhase.Connected) }
-        } else {
-            items(state.timeline, key = TextTimelineItemUi::key) { item ->
-                TimelineCard(item)
-                Spacer(Modifier.height(10.dp))
-            }
-        }
-
-        item {
-            Spacer(Modifier.height(28.dp))
-            Text(
-                text = "BOB · Android HTTPS / TOFU / WSS",
-                color = BobSecondaryInk,
-                fontSize = 12.sp,
-            )
-        }
-        }
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .background(BobBackground)
-                .border(1.dp, BobBorder)
-                .padding(horizontal = 24.dp, vertical = 12.dp),
-        ) {
-            TextComposer(
-                state = state,
-                onDraftChanged = onDraftChanged,
-                onSendText = onSendText,
-                onChooseImages = onChooseImages,
-                onChooseFiles = onChooseFiles,
-            )
-        }
-    }
-}
-
-@Composable
-private fun Header(discoveryLabel: String, active: Boolean) {
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        verticalAlignment = Alignment.Top,
-        horizontalArrangement = Arrangement.SpaceBetween,
-    ) {
-        Column(modifier = Modifier.weight(1f)) {
-            Text(
-                text = "BOB",
-                color = BobInk,
-                fontSize = 40.sp,
-                lineHeight = 42.sp,
-                fontWeight = FontWeight.Black,
-            )
-            Text(
-                text = "Local file, image, and text transfer",
-                color = BobSecondaryInk,
-                fontSize = 14.sp,
-            )
-        }
-        Spacer(Modifier.size(12.dp))
         Row(
-            modifier = Modifier
-                .border(1.dp, BobBorder, RoundedCornerShape(3.dp))
-                .padding(horizontal = 10.dp, vertical = 8.dp),
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp),
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(7.dp),
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            Box(
-                Modifier
-                    .size(8.dp)
-                    .background(if (active) BobInk else BobSecondaryInk),
-            )
-            Text(
-                text = discoveryLabel,
-                color = BobInk,
-                fontSize = 12.sp,
-                maxLines = 2,
-                overflow = TextOverflow.Ellipsis,
-            )
+            Text("BOB", color = BobInk, fontWeight = FontWeight.Black, fontSize = 26.sp)
+            Column(Modifier.weight(1f)) {
+                Text(
+                    state.authenticatedPeerName ?: state.selectedTargetLabel ?: "Your computer",
+                    color = BobInk, fontWeight = FontWeight.SemiBold, fontSize = 15.sp,
+                    maxLines = 1, overflow = TextOverflow.Ellipsis,
+                )
+                Text(state.connectionLabel, color = BobSecondaryInk, fontSize = 12.sp,
+                    modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite })
+            }
+            TextButton(onClick = { settingsExpanded = !settingsExpanded }) {
+                Text(if (settingsExpanded) "Done" else "Settings", color = BobInk)
+            }
+        }
+        Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+            HistoryCategory.entries.forEach { tab ->
+                TextButton(
+                    onClick = { category = tab },
+                    modifier = Modifier.weight(1f).selectable(
+                        selected = category == tab, role = Role.Tab, onClick = { category = tab },
+                    ).background(if (category == tab) BobButton else Color.Transparent, RoundedCornerShape(3.dp)),
+                ) {
+                    Text(tab.label, color = BobInk, fontWeight = if (category == tab) FontWeight.Bold else FontWeight.Normal)
+                }
+            }
+        }
+        if (settingsExpanded) {
+            Column(Modifier.fillMaxWidth().heightIn(max = 300.dp).verticalScroll(rememberScrollState()).padding(16.dp)) {
+                DeviceSection(state, onSelectPeer, onRefresh)
+                Spacer(Modifier.height(10.dp))
+                ManualAddressSection(state.manualIp, onManualIpChanged, onUseManualIp)
+                Spacer(Modifier.height(10.dp))
+                ConnectionSection(state, onRequestConnection, onDisconnect, onResetTrust)
+                Spacer(Modifier.height(8.dp))
+                Text("Received images: Pictures/BOB · Files: Download/BOB", color = BobSecondaryInk, fontSize = 12.sp)
+            }
+        }
+        state.historyWarning?.let {
+            Text(it, modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp), color = BobInk, fontSize = 12.sp)
+        }
+        state.notice?.let {
+            Text(it, modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp), color = BobSecondaryInk, fontSize = 12.sp)
+        }
+        if (!settingsExpanded && state.connectionPhase != ConnectionUiPhase.Connected) {
+            TextButton(onClick = { settingsExpanded = true }, modifier = Modifier.padding(horizontal = 8.dp)) {
+                Text(if (state.isSearching) "Searching on this Wi-Fi · Connection settings" else "Choose a computer or enter its IP address", color = BobInk)
+            }
+        }
+        LazyColumn(
+            state = listState,
+            modifier = Modifier.weight(1f).fillMaxWidth(),
+            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            if (hasEarlier) {
+                item(key = "load-earlier") {
+                    TextButton(onClick = {
+                        val oldIndex = listState.firstVisibleItemIndex
+                        val offset = listState.firstVisibleItemScrollOffset
+                        val added = minOf(40, entries.size - visibleCount)
+                        visibleCount += added
+                        scope.launch { listState.scrollToItem(oldIndex + added - if (entries.size <= visibleCount) 1 else 0, offset) }
+                    }, modifier = Modifier.fillMaxWidth()) {
+                        Text("Load earlier records (${entries.size - visibleCount})", color = BobInk)
+                    }
+                }
+            }
+            if (visibleEntries.isEmpty()) {
+                item { EmptyTimeline(state.connectionPhase == ConnectionUiPhase.Connected, category) }
+            }
+            items(visibleEntries, key = ChatEntry::key) { entry ->
+                entry.text?.let { TimelineCard(it) }
+                entry.transfer?.let { TransferCard(it) }
+            }
+        }
+        if (!followingLatest && entries.isNotEmpty()) {
+            TextButton(onClick = { scope.launch { listState.animateScrollToItem(visibleEntries.lastIndex + if (hasEarlier) 1 else 0) } }, modifier = Modifier.align(Alignment.End)) {
+                Text("Latest messages ↓", color = BobInk)
+            }
+        }
+        Box(Modifier.fillMaxWidth().background(BobBackground).border(1.dp, BobBorder).padding(horizontal = 16.dp, vertical = 10.dp)) {
+            TextComposer(state, onDraftChanged, onSendText, onChooseImages, onChooseFiles)
         }
     }
 }
-
 @Composable
 private fun BorderedSection(content: @Composable ColumnScope.() -> Unit) {
     Column(
@@ -548,7 +538,7 @@ private fun ConnectionSection(
 }
 
 @Composable
-private fun EmptyTimeline(connected: Boolean) {
+private fun EmptyTimeline(connected: Boolean, category: HistoryCategory) {
     Box(
         modifier = Modifier
             .fillMaxWidth()
@@ -558,7 +548,13 @@ private fun EmptyTimeline(connected: Boolean) {
         contentAlignment = Alignment.Center,
     ) {
         Text(
-            text = if (connected) "Securely connected. Send your first text." else "Connect to send text in both directions.",
+            text = when {
+                !connected -> "Your saved records appear here. Connect to share something new."
+                category == HistoryCategory.Images -> "No images yet. Choose Images below to send one."
+                category == HistoryCategory.Files -> "No files yet. Choose Files below to send one."
+                category == HistoryCategory.Text -> "No text messages yet. Write a message below."
+                else -> "Connected. Send a message, image, or file."
+            },
             color = BobSecondaryInk,
             fontSize = 14.sp,
         )
@@ -567,58 +563,50 @@ private fun EmptyTimeline(connected: Boolean) {
 
 @Composable
 private fun TimelineCard(item: TextTimelineItemUi) {
-    val context = LocalContext.current
-    var previewOverflows by remember(item.key) { mutableStateOf(false) }
-    var showFullText by remember(item.key) { mutableStateOf(false) }
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .background(if (item.isOutgoing) BobButton else BobCard)
-            .border(1.dp, BobBorder, RoundedCornerShape(3.dp))
-            .padding(14.dp),
-    ) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
+    var overflow by remember(item.key) { mutableStateOf(false) }
+    var expanded by rememberSaveable(item.key) { mutableStateOf(false) }
+    Box(Modifier.fillMaxWidth(), contentAlignment = if (item.isOutgoing) Alignment.CenterEnd else Alignment.CenterStart) {
+        Column(
+            Modifier.fillMaxWidth(0.88f)
+                .background(if (item.isOutgoing) BobButton else BobCard, RoundedCornerShape(4.dp))
+                .border(1.dp, BobBorder, RoundedCornerShape(4.dp)).padding(12.dp),
         ) {
-            Text(
-                text = "${item.directionLabel} · ${item.statusLabel}",
-                color = BobInk,
-                fontSize = 13.sp,
-                fontWeight = FontWeight.SemiBold,
-            )
-            Text(text = item.timeLabel, color = BobSecondaryInk, fontSize = 12.sp)
+            if (expanded) {
+                // A bounded native selection surface keeps the original string intact,
+                // including selections across a maximum-size message's line boundaries.
+                AndroidView(
+                    modifier = Modifier.fillMaxWidth().heightIn(max = 420.dp),
+                    factory = { context ->
+                        ScrollView(context).apply {
+                            addView(TextView(context).apply {
+                                text = item.text
+                                textSize = 16f
+                                setTextColor(android.graphics.Color.rgb(25, 20, 31))
+                                setTextIsSelectable(true)
+                                setLineSpacing(0f, 1.3f)
+                                setPadding(0, 0, 0, 0)
+                            })
+                        }
+                    },
+                )
+            } else {
+                SelectionContainer {
+                    Text(
+                        text = item.previewText, color = BobInk, fontSize = 16.sp, lineHeight = 23.sp,
+                        maxLines = 8, overflow = TextOverflow.Ellipsis,
+                        onTextLayout = { overflow = it.hasVisualOverflow },
+                    )
+                }
+            }
+            if (expanded || item.isTruncated || overflow) {
+                TextButton(onClick = { expanded = !expanded }) {
+                    Text(if (expanded) "Show less" else "Expand text", color = BobInk, fontSize = 13.sp)
+                }
+            }
+            Spacer(Modifier.height(6.dp))
+            Text("${item.timeLabel} · ${item.statusLabel}", color = BobSecondaryInk, fontSize = 11.sp,
+                modifier = Modifier.align(Alignment.End))
         }
-        Spacer(Modifier.height(8.dp))
-        SelectionContainer {
-            Text(
-                text = item.previewText,
-                color = BobInk,
-                fontSize = 16.sp,
-                lineHeight = 23.sp,
-                maxLines = 8,
-                overflow = TextOverflow.Ellipsis,
-                onTextLayout = { previewOverflows = it.hasVisualOverflow },
-            )
-        }
-        if (item.isTruncated || previewOverflows) {
-            Spacer(Modifier.height(10.dp))
-            BobButton(
-                label = "View full text",
-                onClick = { showFullText = true },
-            )
-        }
-        Spacer(Modifier.height(10.dp))
-        BobButton(
-            label = "Copy full text",
-            onClick = { copyTextToClipboard(context, item.text) },
-        )
-    }
-    if (showFullText) {
-        FullTextDialog(
-            text = item.text,
-            onDismiss = { showFullText = false },
-        )
     }
 }
 
@@ -626,160 +614,98 @@ private fun TimelineCard(item: TextTimelineItemUi) {
 private fun TransferCard(item: TransferTimelineItemUi) {
     val context = LocalContext.current
     val previewUri = item.previewUri
-    var showFullImage by rememberSaveable(item.key, item.previewUri) { mutableStateOf(false) }
-    val thumbnail = previewUri?.let { uri ->
-        rememberContentBitmap(uri, THUMBNAIL_MAX_PIXELS)
-    }
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .background(BobCard)
-            .border(1.dp, BobBorder, RoundedCornerShape(3.dp))
-            .padding(14.dp),
-    ) {
-        Text(
-            text = item.name,
-            color = BobInk,
-            fontSize = 16.sp,
-            fontWeight = FontWeight.SemiBold,
-            maxLines = 2,
-            overflow = TextOverflow.Ellipsis,
-        )
-        Spacer(Modifier.height(6.dp))
-        Text(
-            text = "${item.directionLabel} ${item.kindLabel.lowercase()} · ${item.statusLabel}",
-            color = BobInk,
-            fontSize = 13.sp,
-        )
-        Spacer(Modifier.height(4.dp))
-        Text(text = item.progressLabel, color = BobSecondaryInk, fontSize = 13.sp)
-        if (thumbnail != null) {
-            Spacer(Modifier.height(10.dp))
-            Image(
-                bitmap = remember(thumbnail) { thumbnail.asImageBitmap() },
-                contentDescription = "Preview of ${item.name}",
-                contentScale = ContentScale.Crop,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(180.dp)
-                    .clip(RoundedCornerShape(3.dp))
-                    .background(BobButton)
-                    .clickable(
-                        role = Role.Button,
-                        onClickLabel = "View full image",
-                        onClick = { showFullImage = true },
+    var showFullImage by rememberSaveable(item.key, previewUri) { mutableStateOf(false) }
+    var showImageMenu by remember(item.key) { mutableStateOf(false) }
+    val thumbnail = previewUri?.let { rememberContentBitmap(it, THUMBNAIL_MAX_PIXELS) }
+    Box(Modifier.fillMaxWidth(), contentAlignment = if (item.isOutgoing) Alignment.CenterEnd else Alignment.CenterStart) {
+        Column(
+            Modifier.fillMaxWidth(0.88f)
+                .background(if (item.isOutgoing) BobButton else BobCard, RoundedCornerShape(4.dp))
+                .border(1.dp, BobBorder, RoundedCornerShape(4.dp))
+                .then(if (item.kindLabel == "File" && item.statusLabel == "Completed" && item.contentUri != null) {
+                    Modifier.clickable(role = Role.Button, onClickLabel = "Open file") {
+                        openLocalFile(context, item.contentUri, item.mediaType)
+                    }
+                } else Modifier).padding(10.dp),
+        ) {
+            if (thumbnail != null) {
+                Box {
+                    Image(
+                        bitmap = remember(thumbnail) { thumbnail.asImageBitmap() },
+                        contentDescription = "${item.name}. Tap to view, touch and hold for image actions.",
+                        contentScale = ContentScale.Fit,
+                        modifier = Modifier.fillMaxWidth().heightIn(min = 100.dp, max = 240.dp)
+                            .clip(RoundedCornerShape(3.dp)).background(BobBackground)
+                            .combinedClickable(
+                                role = Role.Button, onClickLabel = "View image",
+                                onLongClickLabel = "Image actions",
+                                onClick = { showFullImage = true }, onLongClick = { showImageMenu = true },
+                            ),
                     )
-                    .border(1.dp, BobBorder, RoundedCornerShape(3.dp)),
-            )
-            Spacer(Modifier.height(8.dp))
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                BobButton(
-                    label = "View image",
-                    onClick = { showFullImage = true },
-                    modifier = Modifier.weight(1f),
-                )
-                BobButton(
-                    label = "Copy image",
-                    onClick = { copyImageToClipboard(context, item.name, previewUri) },
-                    modifier = Modifier.weight(1f),
-                )
+                    DropdownMenu(expanded = showImageMenu, onDismissRequest = { showImageMenu = false }) {
+                        DropdownMenuItem(text = { Text("Copy image") }, onClick = {
+                            showImageMenu = false
+                            copyImageToClipboard(context, item.name, previewUri)
+                        })
+                    }
+                }
+                Spacer(Modifier.height(8.dp))
             }
-        } else if (previewUri != null) {
-            Spacer(Modifier.height(8.dp))
-            BobButton(
-                label = "Copy image",
-                onClick = { copyImageToClipboard(context, item.name, previewUri) },
-                fillWidth = true,
-            )
-        }
-        item.errorMessage?.let { error ->
+            Text(item.name, color = BobInk, fontSize = 14.sp, fontWeight = FontWeight.SemiBold,
+                maxLines = 2, overflow = TextOverflow.Ellipsis)
+            Spacer(Modifier.height(4.dp))
+            Text("${item.kindLabel} · ${item.progressLabel}", color = BobSecondaryInk, fontSize = 12.sp)
+            item.errorMessage?.let {
+                Spacer(Modifier.height(5.dp))
+                Text(it, color = BobInk, fontSize = 12.sp, lineHeight = 18.sp)
+            }
+            if (previewUri != null && thumbnail == null) {
+                Text("Image preview unavailable", color = BobSecondaryInk, fontSize = 12.sp)
+            }
             Spacer(Modifier.height(6.dp))
-            Text(text = error, color = BobInk, fontSize = 13.sp, lineHeight = 18.sp)
+            Text("${item.timeLabel} · ${item.statusLabel}", color = BobSecondaryInk, fontSize = 11.sp,
+                modifier = Modifier.align(Alignment.End))
         }
     }
     if (showFullImage && thumbnail != null) {
-        FullImageDialog(
-            name = item.name,
-            previewUri = item.previewUri,
-            thumbnail = thumbnail,
-            onDismiss = { showFullImage = false },
-        )
+        FullImageDialog(item.name, previewUri, thumbnail, onDismiss = { showFullImage = false })
     }
 }
 
 @Composable
-private fun FullImageDialog(
-    name: String,
-    previewUri: String,
-    thumbnail: Bitmap,
-    onDismiss: () -> Unit,
-) {
+private fun FullImageDialog(name: String, previewUri: String, thumbnail: Bitmap, onDismiss: () -> Unit) {
     val context = LocalContext.current
-    val fullImage = rememberContentBitmap(
-        uriValue = previewUri,
-        maxDimension = FULL_IMAGE_MAX_PIXELS,
-        fallback = thumbnail,
-    ) ?: thumbnail
-    Dialog(
-        onDismissRequest = onDismiss,
-        properties = DialogProperties(usePlatformDefaultWidth = false),
-    ) {
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(20.dp)
-                .background(BobCard)
-                .border(2.dp, BobBorder, RoundedCornerShape(4.dp))
-                .padding(16.dp),
-        ) {
-            Text(
-                text = "Image preview",
-                color = BobInk,
-                fontSize = 20.sp,
-                fontWeight = FontWeight.Bold,
-            )
-            Spacer(Modifier.height(4.dp))
-            Text(
-                text = name,
-                color = BobSecondaryInk,
-                fontSize = 14.sp,
-                maxLines = 2,
-                overflow = TextOverflow.Ellipsis,
-            )
-            Spacer(Modifier.height(12.dp))
-            Image(
-                bitmap = remember(fullImage) { fullImage.asImageBitmap() },
-                contentDescription = "Full image preview of $name",
-                contentScale = ContentScale.Fit,
-                modifier = Modifier
-                    .weight(1f)
-                    .fillMaxWidth()
-                    .background(Color.Black)
-                    .border(1.dp, BobBorder, RoundedCornerShape(3.dp)),
-            )
-            Spacer(Modifier.height(12.dp))
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                BobButton(
-                    label = "Copy image",
-                    onClick = { copyImageToClipboard(context, name, previewUri) },
-                    modifier = Modifier.weight(1f),
-                )
-                BobButton(
-                    label = "Close",
-                    onClick = onDismiss,
-                    modifier = Modifier.weight(1f),
-                )
+    var imageMenu by remember { mutableStateOf(false) }
+    val fullImage = rememberContentBitmap(previewUri, FULL_IMAGE_MAX_PIXELS, thumbnail) ?: thumbnail
+    Dialog(onDismissRequest = onDismiss, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+        Column(Modifier.fillMaxSize().padding(12.dp).background(BobCard)
+            .border(1.dp, BobBorder, RoundedCornerShape(4.dp)).padding(12.dp)) {
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Text(name, color = BobInk, fontSize = 14.sp, maxLines = 2,
+                    overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+                TextButton(onClick = onDismiss) { Text("Close", color = BobInk) }
             }
+            Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
+                Image(
+                    bitmap = remember(fullImage) { fullImage.asImageBitmap() },
+                    contentDescription = "Image preview of $name. Touch and hold to copy.",
+                    contentScale = ContentScale.Fit,
+                    modifier = Modifier.fillMaxSize().background(Color.Black)
+                        .combinedClickable(onClick = {}, onLongClick = { imageMenu = true },
+                            onLongClickLabel = "Image actions"),
+                )
+                DropdownMenu(expanded = imageMenu, onDismissRequest = { imageMenu = false }) {
+                    DropdownMenuItem(text = { Text("Copy image") }, onClick = {
+                        imageMenu = false
+                        copyImageToClipboard(context, name, previewUri)
+                    })
+                }
+            }
+            Text("Touch and hold the image to copy", color = BobSecondaryInk, fontSize = 12.sp,
+                modifier = Modifier.padding(top = 8.dp))
         }
     }
 }
-
 @Composable
 private fun rememberContentBitmap(
     uriValue: String,
@@ -814,64 +740,6 @@ private fun rememberContentBitmap(
 }
 
 @Composable
-private fun FullTextDialog(text: String, onDismiss: () -> Unit) {
-    val context = LocalContext.current
-    val chunks = remember(text) { text.toDisplayChunks() }
-    Dialog(onDismissRequest = onDismiss) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .heightIn(min = 240.dp, max = 560.dp)
-                .background(BobCard)
-                .border(2.dp, BobBorder, RoundedCornerShape(4.dp))
-                .padding(18.dp),
-        ) {
-            Text(
-                text = "Full text",
-                color = BobInk,
-                fontSize = 20.sp,
-                fontWeight = FontWeight.Bold,
-            )
-            Spacer(Modifier.height(12.dp))
-            LazyColumn(
-                modifier = Modifier
-                    .weight(1f)
-                    .fillMaxWidth()
-                    .border(1.dp, BobBorder, RoundedCornerShape(3.dp))
-                    .padding(12.dp),
-            ) {
-                items(chunks, key = { it.index }) { chunk ->
-                    SelectionContainer {
-                        Text(
-                            text = chunk.text,
-                            color = BobInk,
-                            fontSize = 16.sp,
-                            lineHeight = 23.sp,
-                        )
-                    }
-                }
-            }
-            Spacer(Modifier.height(12.dp))
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                BobButton(
-                    label = "Copy full text",
-                    onClick = { copyTextToClipboard(context, text) },
-                    modifier = Modifier.weight(1f),
-                )
-                BobButton(
-                    label = "Close",
-                    onClick = onDismiss,
-                    modifier = Modifier.weight(1f),
-                )
-            }
-        }
-    }
-}
-
-@Composable
 private fun TextComposer(
     state: BobUiState,
     onDraftChanged: (String) -> Unit,
@@ -879,102 +747,53 @@ private fun TextComposer(
     onChooseImages: () -> Unit,
     onChooseFiles: () -> Unit,
 ) {
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .heightIn(max = 260.dp)
-            .verticalScroll(rememberScrollState()),
-    ) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            BobButton(
-                label = "Choose images",
-                onClick = onChooseImages,
-                modifier = Modifier.weight(1f),
-                enabled = state.canChooseContent,
-            )
-            BobButton(
-                label = "Choose files",
-                onClick = onChooseFiles,
-                modifier = Modifier.weight(1f),
-                enabled = state.canChooseContent,
-            )
-        }
-        Spacer(Modifier.height(10.dp))
+    Column(Modifier.fillMaxWidth().heightIn(max = 220.dp).verticalScroll(rememberScrollState())) {
         OutlinedTextField(
             value = state.draftText,
             onValueChange = onDraftChanged,
             modifier = Modifier.fillMaxWidth(),
-            label = { Text("Send text") },
-            placeholder = { Text("Enter or paste text. It will be sent unchanged.") },
-            supportingText = {
-                Text(
-                    state.draftError ?: if (state.connectionPhase == ConnectionUiPhase.Connected) {
-                        "Text is saved first, then sent over WSS and held until the computer acknowledges it."
-                    } else {
-                        "Connect securely to enable sending."
-                    },
-                    modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite },
-                )
-            },
+            placeholder = { Text("Message") },
             isError = state.draftError != null,
-            minLines = 2,
-            maxLines = 5,
+            minLines = 1,
+            maxLines = 4,
             shape = RoundedCornerShape(3.dp),
             colors = OutlinedTextFieldDefaults.colors(
-                focusedBorderColor = BobBorder,
-                unfocusedBorderColor = BobBorder,
-                focusedContainerColor = BobButton,
-                unfocusedContainerColor = BobButton,
+                focusedBorderColor = BobBorder, unfocusedBorderColor = BobBorder,
+                focusedContainerColor = BobButton, unfocusedContainerColor = BobButton,
                 cursorColor = BobInk,
             ),
         )
-        Spacer(Modifier.height(10.dp))
-        BobButton(
-            label = if (state.isQueueingText) "Queueing" else "Send text",
-            onClick = onSendText,
-            enabled = state.canSendText,
-            fillWidth = true,
-        )
-    }
-}
-
-private data class DisplayTextChunk(val index: Int, val text: String)
-
-private fun String.toDisplayChunks(): List<DisplayTextChunk> {
-    if (isEmpty()) return listOf(DisplayTextChunk(0, ""))
-    val chunks = ArrayList<DisplayTextChunk>((length / DISPLAY_CHUNK_CHARS) + 1)
-    var start = 0
-    var index = 0
-    while (start < length) {
-        var end = minOf(start + DISPLAY_CHUNK_CHARS, length)
-        if (end < length && this[end - 1].isHighSurrogate() && this[end].isLowSurrogate()) {
-            end -= 1
+        state.draftError?.let { Text(it, color = BobInk, fontSize = 12.sp, modifier = Modifier.padding(top = 4.dp)) }
+        Row(Modifier.fillMaxWidth().padding(top = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+            TextButton(onClick = onChooseImages, enabled = state.canChooseContent) { Text("Images", color = BobInk) }
+            TextButton(onClick = onChooseFiles, enabled = state.canChooseContent) { Text("Files", color = BobInk) }
+            Spacer(Modifier.weight(1f))
+            BobButton(
+                label = if (state.isQueueingText) "Sending" else "Send",
+                onClick = onSendText, enabled = state.canSendText,
+            )
         }
-        chunks += DisplayTextChunk(index++, substring(start, end))
-        start = end
     }
-    return chunks
 }
 
-private fun copyTextToClipboard(context: Context, text: String) {
-    val copied = runCatching {
-        val clipboard = context.getSystemService(ClipboardManager::class.java)
-        clipboard.setPrimaryClip(ClipData.newPlainText("BOB text", text))
+private fun openLocalFile(context: Context, uriValue: String, mediaType: String) {
+    val opened = runCatching {
+        val uri = Uri.parse(uriValue)
+        require(uri.scheme == "content")
+        context.contentResolver.openAssetFileDescriptor(uri, "r")?.use { }
+            ?: error("The file is no longer available.")
+        context.startActivity(Intent(Intent.ACTION_VIEW)
+            .setDataAndType(uri, mediaType)
+            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION))
     }.isSuccess
-    Toast.makeText(
-        context,
-        if (copied) "Text copied" else "Could not copy text",
-        Toast.LENGTH_SHORT,
-    ).show()
+    if (!opened) Toast.makeText(context, "The file is unavailable or no app can open it.", Toast.LENGTH_SHORT).show()
 }
-
 private fun copyImageToClipboard(context: Context, name: String, uriValue: String) {
     val copied = runCatching {
         val uri = Uri.parse(uriValue)
         require(uri.scheme == "content") { "Only local content URIs can be copied." }
+        context.contentResolver.openAssetFileDescriptor(uri, "r")?.use { }
+            ?: error("The image is no longer available.")
         val clipboard = context.getSystemService(ClipboardManager::class.java)
         clipboard.setPrimaryClip(
             ClipData.newUri(context.contentResolver, name.ifBlank { "BOB image" }, uri),
@@ -987,7 +806,6 @@ private fun copyImageToClipboard(context: Context, name: String, uriValue: Strin
     ).show()
 }
 
-private const val DISPLAY_CHUNK_CHARS = 512
 private const val THUMBNAIL_MAX_PIXELS = 720
 private const val FULL_IMAGE_MAX_PIXELS = 2_048
 

@@ -1,6 +1,7 @@
 package com.bob.android.ui
 
 import android.app.Application
+import android.content.Context
 import android.net.InetAddresses
 import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
@@ -35,6 +36,7 @@ import kotlinx.coroutines.launch
 class BobViewModel(application: Application) : AndroidViewModel(application) {
     private val discovery = NsdBobDiscoveryService(application)
     private val connection = BobConnectionCoordinator(application, viewModelScope)
+    private val historyPreferences = application.getSharedPreferences("history-peer", Context.MODE_PRIVATE)
     private val selectedTarget = MutableStateFlow<SelectedTarget?>(null)
     private val manualIp = MutableStateFlow("")
     private val notice = MutableStateFlow<String?>(null)
@@ -67,6 +69,8 @@ class BobViewModel(application: Application) : AndroidViewModel(application) {
         connection.transferItems,
     ) { base, draft, queueing, messages, transfers ->
         buildUiState(base, draft, queueing, messages, transfers)
+    }.combine(connection.transferHistoryWarning) { state, warning ->
+        state.copy(historyWarning = warning)
     }.stateIn(
         scope = viewModelScope,
         started = SharingStarted.Eagerly,
@@ -74,6 +78,16 @@ class BobViewModel(application: Application) : AndroidViewModel(application) {
     )
 
     init {
+        viewModelScope.launch {
+            connection.state.collect { state ->
+                if (state.isConnected && state.serverId != null) {
+                    historyPreferences.edit()
+                        .putString("serverId", state.serverId.toString())
+                        .putString("target", selectedTarget.value?.draftIdentity())
+                        .apply()
+                }
+            }
+        }
         viewModelScope.launch {
             discovery.snapshot.collect { snapshot ->
                 reconcileAutomaticSelection(snapshot)
@@ -348,16 +362,17 @@ class BobViewModel(application: Application) : AndroidViewModel(application) {
                 "UTF-8 content exceeds the current connection limit of $maxTextBytes bytes."
             else -> null
         }
-        val activeServerId = connectionState.serverId?.toString()
-        val timeline = if (activeServerId == null) {
-            messages.asReversed().take(RECENT_MESSAGE_LIMIT).map(::toTimelineItem)
-        } else {
-            messages
-                .filter { it.serverId == activeServerId }
-                .asReversed()
-                .take(RECENT_MESSAGE_LIMIT)
-                .map(::toTimelineItem)
+        val activeServerId = when (selection) {
+            is SelectedTarget.Discovered -> selection.deviceId
+            is SelectedTarget.Manual -> if (connectionState.isConnected) {
+                connectionState.serverId?.toString()
+            } else if (historyPreferences.getString("target", null) == selection.draftIdentity()) {
+                historyPreferences.getString("serverId", null)
+            } else null
+            null -> connectionState.serverId?.toString() ?: historyPreferences.getString("serverId", null)
         }
+        val timeline = messages.filter { activeServerId != null && it.serverId == activeServerId }
+            .map(::toTimelineItem)
         val connectionPresentation = presentConnection(connectionState, selection != null)
         val busy = connectionState.phase in setOf(
             BobConnectionPhase.Securing,
@@ -402,7 +417,8 @@ class BobViewModel(application: Application) : AndroidViewModel(application) {
             canChooseContent = connectionState.isConnected,
             isQueueingText = queueing,
             timeline = timeline,
-            transfers = transfers.asReversed().map(::toTransferTimelineItem),
+            transfers = transfers.filter { activeServerId != null && it.serverId == activeServerId }
+                .map(::toTransferTimelineItem),
         )
     }
 
@@ -449,6 +465,7 @@ class BobViewModel(application: Application) : AndroidViewModel(application) {
             statusLabel = status,
             timeLabel = TIME_FORMATTER.format(message.localReceivedAt),
             isOutgoing = outgoing,
+            recordedAtMillis = message.localReceivedAt.toEpochMilli(),
         )
     }
 
@@ -481,6 +498,11 @@ class BobViewModel(application: Application) : AndroidViewModel(application) {
                 ?.takeIf { item.kind == BobTransferKind.Image }
                 ?.toString(),
             errorMessage = item.errorMessage,
+            isOutgoing = item.direction == com.bob.android.transfer.OnlineTransferDirection.Outgoing,
+            recordedAtMillis = item.localRecordedAt.toEpochMilli(),
+            timeLabel = TIME_FORMATTER.format(item.localRecordedAt),
+            contentUri = item.localContentUri?.toString(),
+            mediaType = item.mediaType,
         )
     }
 
@@ -606,7 +628,6 @@ class BobViewModel(application: Application) : AndroidViewModel(application) {
         const val MAX_MANUAL_IP_LENGTH = 64
         const val MAX_DRAFT_CHARACTERS = 300_000
         const val MAX_TIMELINE_PREVIEW_CHARS = 1_200
-        const val RECENT_MESSAGE_LIMIT = 20
         const val BACKGROUND_DISCONNECT_DELAY_MILLIS = 2_000L
         const val AUTOMATIC_CONNECT_SETTLE_MILLIS = 1_200L
         val TIME_FORMATTER: DateTimeFormatter = DateTimeFormatter

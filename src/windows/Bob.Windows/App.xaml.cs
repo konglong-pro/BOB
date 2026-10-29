@@ -7,6 +7,7 @@ using Bob.Windows.Security;
 using Bob.Windows.Storage;
 using Bob.Windows.Transport;
 using Bob.Windows.UI;
+using Bob.Windows.Platform;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Server.Kestrel.Core;
@@ -20,10 +21,14 @@ public partial class App : Application
     private WebApplication? _host;
     private ServerIdentity? _identity;
     private Mutex? _singleInstanceMutex;
+    private EventWaitHandle? _activateSignal;
+    private DesktopLifetime? _desktop;
 
     protected override async void OnStartup(StartupEventArgs e)
     {
         base.OnStartup(e);
+
+        _activateSignal = new EventWaitHandle(false, EventResetMode.AutoReset, @"Local\BOB.Windows.Activate.v1");
 
         var instanceMutex = new Mutex(
             initiallyOwned: true,
@@ -32,11 +37,7 @@ public partial class App : Application
         if (!createdNew)
         {
             instanceMutex.Dispose();
-            MessageBox.Show(
-                "BOB is already running.",
-                "BOB",
-                MessageBoxButton.OK,
-                MessageBoxImage.Information);
+            _activateSignal.Set();
             Shutdown(0);
             return;
         }
@@ -74,6 +75,7 @@ public partial class App : Application
             builder.Services.AddSingleton(identity);
             builder.Services.AddHostedService<MdnsAdvertisementService>();
             builder.Services.AddSingleton<TextHistoryStore>();
+            builder.Services.AddSingleton<TransferHistoryStore>();
             builder.Services.AddSingleton<SessionCoordinator>();
             builder.Services.AddSingleton<ReceiveDirectorySettings>();
             builder.Services.AddSingleton<TransferCoordinator>();
@@ -85,7 +87,10 @@ public partial class App : Application
             BobEndpoints.Map(_host);
 
             await _host.StartAsync();
-            _host.Services.GetRequiredService<MainWindow>().Show();
+            var window = _host.Services.GetRequiredService<MainWindow>();
+            MainWindow = window;
+            window.Show();
+            _desktop = new DesktopLifetime(window, (MainWindowViewModel)window.DataContext, paths, _activateSignal);
         }
         catch (Exception)
         {
@@ -101,6 +106,8 @@ public partial class App : Application
 
     protected override void OnExit(ExitEventArgs e)
     {
+        _desktop?.Dispose();
+        _activateSignal?.Dispose();
         try
         {
             if (_host is not null)
@@ -136,6 +143,12 @@ public partial class App : Application
                 base.OnExit(e);
             }
         }
+    }
+
+    protected override void OnSessionEnding(SessionEndingCancelEventArgs e)
+    {
+        _desktop?.AllowExit();
+        base.OnSessionEnding(e);
     }
 
     private void ReleaseSingleInstance()

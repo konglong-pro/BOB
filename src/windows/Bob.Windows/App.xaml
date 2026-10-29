@@ -1,6 +1,7 @@
 <Application x:Class="Bob.Windows.App"
              xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
-             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             ShutdownMode="OnExplicitShutdown">
     <Application.Resources>
         <SolidColorBrush x:Key="CanvasBrush" Color="#CBA6F7" />
         <SolidColorBrush x:Key="InkBrush" Color="#19141F" />

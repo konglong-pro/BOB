@@ -25,6 +25,8 @@ internal static class RealTransportChecks
         var connectionSnapshots = new List<ConnectionSnapshot>();
         var disconnected = new TaskCompletionSource<ConnectionSnapshot>(
             TaskCreationOptions.RunContinuationsAsynchronously);
+        var connected = new TaskCompletionSource<ConnectionSnapshot>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
         host.Sessions.ConnectionChanged += (_, snapshot) =>
         {
             lock (connectionSnapshots)
@@ -36,8 +38,11 @@ internal static class RealTransportChecks
             {
                 disconnected.TrySetResult(snapshot);
             }
+            if (snapshot.Phase == SessionPhase.Connected) connected.TrySetResult(snapshot);
         };
         await OpenSessionAsync(host, socket, timeout.Token);
+        // Receiving the final frame can race with its sender updating local UI state.
+        await connected.Task.WaitAsync(timeout.Token);
 
         Ensure(
             host.Sessions.Snapshot.Phase == SessionPhase.Connected

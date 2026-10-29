@@ -3,6 +3,7 @@ package com.bob.android.transfer
 import android.content.ContentResolver
 import android.content.ContentValues
 import android.content.Context
+import android.content.Intent
 import android.net.Uri
 import android.os.Environment
 import android.provider.MediaStore
@@ -18,6 +19,8 @@ import com.bob.android.network.BobTransferProgress
 import com.bob.android.network.BobTransferTerminalAck
 import com.bob.android.network.BobTransferTerminalState
 import com.bob.android.network.BobWebSocketSession
+import com.bob.android.persistence.AtomicTransferHistoryStore
+import com.bob.android.persistence.TransferHistoryCheckpointWriter
 import java.io.ByteArrayOutputStream
 import java.io.FileNotFoundException
 import java.io.IOException
@@ -63,6 +66,7 @@ enum class OnlineTransferState {
 
 data class OnlineTransferItem(
     val transferId: String,
+    val serverId: String,
     val direction: OnlineTransferDirection,
     val kind: BobTransferKind,
     val name: String,
@@ -74,6 +78,7 @@ data class OnlineTransferItem(
     val localContentUri: Uri?,
     val errorMessage: String?,
     val createdAt: Instant,
+    val localRecordedAt: Instant = Instant.now(),
 )
 
 /** Online-only transfer worker. Durable/offline recovery belongs to a later repository slice. */
@@ -85,7 +90,13 @@ class OnlineTransferCoordinator(
     private val lock = Any()
     private val incomingOfferMutex = Mutex()
     private val records = linkedMapOf<UUID, TransferRecord>()
-    private val mutableItems = MutableStateFlow<List<OnlineTransferItem>>(emptyList())
+    private val historyStore = AtomicTransferHistoryStore(context)
+    private var archivedItems = historyStore.read()
+    private var requestedHistoryShape = archivedItems.map { it.copy(bytesTransferred = 0) }
+    private val historyWriter = TransferHistoryCheckpointWriter(historyStore, scope)
+    private var lastHistoryCheckpoint = 0L
+    val historyWarning: StateFlow<String?> = historyWriter.warning
+    private val mutableItems = MutableStateFlow(archivedItems)
     val items: StateFlow<List<OnlineTransferItem>> = mutableItems.asStateFlow()
 
     private var transport: ActiveTransport? = null
@@ -129,17 +140,25 @@ class OnlineTransferCoordinator(
     }
 
     suspend fun queueOutgoing(uris: List<Uri>, kind: BobTransferKind) {
+        val serverId = synchronized(lock) { transport?.connection?.serverInfo?.serverId?.toString() }
+            ?: return
         for (uri in uris.distinct()) {
             val transferId = UUID.randomUUID()
             val createdAt = Instant.now()
             val metadata = runCatching {
-                withContext(Dispatchers.IO) { readSourceMetadata(uri, kind) }
+                withContext(Dispatchers.IO) {
+                    // Pickers may grant durable access; temporary providers remain usable for
+                    // the current session and will naturally become unavailable in history.
+                    runCatching { resolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) }
+                    readSourceMetadata(uri, kind)
+                }
             }
             val record = metadata.fold(
                 onSuccess = { source ->
                     TransferRecord(
                         item = OnlineTransferItem(
                             transferId = transferId.toString(),
+                            serverId = serverId,
                             direction = OnlineTransferDirection.Outgoing,
                             kind = kind,
                             name = source.name,
@@ -159,6 +178,7 @@ class OnlineTransferCoordinator(
                     TransferRecord(
                         item = OnlineTransferItem(
                             transferId = transferId.toString(),
+                            serverId = serverId,
                             direction = OnlineTransferDirection.Outgoing,
                             kind = kind,
                             name = "Unavailable content",
@@ -175,6 +195,13 @@ class OnlineTransferCoordinator(
                 },
             )
             synchronized(lock) {
+                val currentServerId = transport?.connection?.serverInfo?.serverId?.toString()
+                if (currentServerId != null && currentServerId != serverId) {
+                    record.item = record.item.copy(
+                        state = OnlineTransferState.Failed,
+                        errorMessage = "The computer connection changed. Select the content again to resend.",
+                    )
+                }
                 records[transferId] = record
                 publishLocked()
             }
@@ -227,6 +254,7 @@ class OnlineTransferCoordinator(
 
     fun onCompleted(completed: BobTransferCompleted) {
         var duplicateSession: BobWebSocketSession? = null
+        var checkpoint = 0L
         val result = synchronized(lock) {
             val record = records[completed.transferId] ?: return
             if (record.item.direction != OnlineTransferDirection.Outgoing) {
@@ -234,6 +262,7 @@ class OnlineTransferCoordinator(
             }
             if (record.item.state == OnlineTransferState.Completed) {
                 duplicateSession = transport?.session
+                checkpoint = lastHistoryCheckpoint
                 return@synchronized true to duplicateSession
             }
             val valid = record.localBytes == completed.bytes &&
@@ -254,15 +283,19 @@ class OnlineTransferCoordinator(
                 )
                 record.terminalAckPending = false
                 publishLocked()
+                checkpoint = lastHistoryCheckpoint
                 true to transport?.session
             }
         }
         if (result.first) {
-            (duplicateSession ?: result.second)?.acknowledgeTransferTerminal(
-                completed.transferId,
-                BobTransferTerminalState.Completed,
-            )
-            drainOutgoing()
+            scope.launch {
+                historyWriter.await(checkpoint)
+                (duplicateSession ?: result.second)?.acknowledgeTransferTerminal(
+                    completed.transferId,
+                    BobTransferTerminalState.Completed,
+                )
+                drainOutgoing()
+            }
         } else {
             result.second?.close(4400, "invalid_metadata")
         }
@@ -272,6 +305,7 @@ class OnlineTransferCoordinator(
         val cleanup: Uri?
         val session: BobWebSocketSession?
         var completedWins = false
+        val checkpoint: Long
         synchronized(lock) {
             val record = records[failed.transferId] ?: return
             session = transport?.session
@@ -290,14 +324,21 @@ class OnlineTransferCoordinator(
                 record.terminalAckPending = false
                 publishLocked()
             }
+            checkpoint = lastHistoryCheckpoint
         }
         if (completedWins) {
-            session?.acknowledgeTransferTerminal(failed.transferId, BobTransferTerminalState.Completed)
+            scope.launch {
+                historyWriter.await(checkpoint)
+                session?.acknowledgeTransferTerminal(failed.transferId, BobTransferTerminalState.Completed)
+            }
             return
         }
         cleanup?.let { uri -> scope.launch(Dispatchers.IO) { runCatching { resolver.delete(uri, null, null) } } }
-        session?.acknowledgeTransferTerminal(failed.transferId, BobTransferTerminalState.Failed)
-        drainOutgoing()
+        scope.launch {
+            historyWriter.await(checkpoint)
+            session?.acknowledgeTransferTerminal(failed.transferId, BobTransferTerminalState.Failed)
+            drainOutgoing()
+        }
     }
 
     fun onTerminalAck(acknowledgement: BobTransferTerminalAck) {
@@ -398,6 +439,7 @@ class OnlineTransferCoordinator(
             record = TransferRecord(
                 item = OnlineTransferItem(
                     transferId = offer.transferId.toString(),
+                    serverId = currentTransport.connection.serverInfo.serverId.toString(),
                     direction = OnlineTransferDirection.Incoming,
                     kind = offer.kind,
                     name = offer.name,
@@ -436,14 +478,15 @@ class OnlineTransferCoordinator(
     private fun drainOutgoing() {
         val next = synchronized(lock) {
             val currentTransport = transport ?: return
+            val currentServerId = currentTransport.connection.serverInfo.serverId.toString()
             val active = records.values.any { record ->
-                record.item.direction == OnlineTransferDirection.Outgoing &&
+                record.item.serverId == currentServerId && record.item.direction == OnlineTransferDirection.Outgoing &&
                     !record.item.state.isTerminal() &&
                     record.item.state != OnlineTransferState.Queued
             }
             if (active) return
             val record = records.values.firstOrNull { item ->
-                item.item.direction == OnlineTransferDirection.Outgoing &&
+                item.item.serverId == currentServerId && item.item.direction == OnlineTransferDirection.Outgoing &&
                     item.item.state == OnlineTransferState.Queued
             } ?: return
             record.item = record.item.copy(state = OnlineTransferState.Offered)
@@ -672,13 +715,14 @@ class OnlineTransferCoordinator(
                     )
                     record.terminalAckPending = true
                     publishLocked()
-                    record.item
+                    record.item to lastHistoryCheckpoint
                 } ?: return@launch
+                historyWriter.await(completed.second)
                 ready.transport?.session?.sendTransferCompleted(
                     transferId = transferId,
                     bytes = ready.localBytes,
                     sha256 = ready.localSha256,
-                    storedName = completed.storedName ?: completed.name,
+                    storedName = completed.first.storedName ?: completed.first.name,
                 )
             } catch (error: Exception) {
                 failTransfer(
@@ -697,6 +741,7 @@ class OnlineTransferCoordinator(
     ) {
         val pending: Uri?
         val session: BobWebSocketSession?
+        val checkpoint: Long
         synchronized(lock) {
             val record = records[transferId] ?: return
             if (record.item.state.isTerminal()) return
@@ -711,10 +756,14 @@ class OnlineTransferCoordinator(
             record.terminalAckPending = true
             session = transport?.session
             publishLocked()
+            checkpoint = lastHistoryCheckpoint
         }
         pending?.let { uri -> scope.launch(Dispatchers.IO) { runCatching { resolver.delete(uri, null, null) } } }
-        session?.sendTransferFailed(transferId, code, message, retryable = true)
-        drainOutgoing()
+        scope.launch {
+            historyWriter.await(checkpoint)
+            session?.sendTransferFailed(transferId, code, message, retryable = true)
+            drainOutgoing()
+        }
     }
 
     private fun updateProgress(transferId: UUID, bytes: Long) {
@@ -808,9 +857,17 @@ class OnlineTransferCoordinator(
     }
 
     private fun publishLocked() {
-        mutableItems.value = records.values
-            .map(TransferRecord::item)
-            .sortedBy(OnlineTransferItem::createdAt)
+        val live = records.values.map(TransferRecord::item)
+        val liveIds = live.mapTo(hashSetOf(), OnlineTransferItem::transferId)
+        archivedItems = (archivedItems.filterNot { it.transferId in liveIds } + live)
+            .sortedBy(OnlineTransferItem::localRecordedAt)
+        val shape = archivedItems.map { it.copy(bytesTransferred = 0) }
+        if (shape != requestedHistoryShape) {
+            // Progress stays in memory; state changes go through one ordered I/O writer.
+            requestedHistoryShape = shape
+            lastHistoryCheckpoint = historyWriter.request(archivedItems)
+        }
+        mutableItems.value = archivedItems
     }
 
     private data class ActiveTransport(
